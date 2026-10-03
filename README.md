@@ -1,0 +1,92 @@
+# OneEgress
+
+单一共享出口，断线不回落。项目：[zylimit/OneEgress](https://github.com/zylimit/OneEgress)。
+
+所有工作壳（包括不同 Linux 用户）共用一个出口节点。`switch` 全局生效，`shell` 只选用户。出口不可用时联网请求失败；SSH 管理网络保留原路线。唯一出口节点不等于固定公网 IP，运营商 NAT 可能为不同目标分配不同地址。
+
+## 首版支持范围
+
+Ubuntu 24.04、systemd、管理默认网卡 `eth0`、`/dev/net/tun`，管理员已确认宿主机 IPv4 转发策略（`net.ipv4.ip_forward=1`）。不是整机 VPN，也不会把普通 SSH 窗口自动改成工作出口。root / sudo 主动绕过隔离不在保证范围内；程序已经失败的请求是否自动重试由程序决定。
+
+依赖：Tailscale、curl、jq、iproute2、iptables（含 IPv6）、Python 3、util-linux。Tailscale 请按[官方安装说明](https://tailscale.com/docs/install)安装；本项目不运行远程安装脚本、不自动安装依赖。
+
+系统 `tailscaled` 必须 **inactive / masked**。不要在依赖 Tailscale 的 SSH 连接里停止它；若已有整机 VPN/出口，先通过独立管理连接处理。安装器只检查，不擅自修改系统服务或管理路由。
+
+## 下载与安装
+
+从 [Releases](https://github.com/zylimit/OneEgress/releases) 下载指定版本和校验文件。推荐固定版本，不执行 `curl | sudo bash`。
+
+```bash
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.0/oneegress-v0.1.0.tar.gz
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c SHA256SUMS
+tar -xzf oneegress-v0.1.0.tar.gz
+cd oneegress-0.1.0
+sudo ./install.sh --check
+sudo ./install.sh
+egress --version
+```
+
+现有机器升级使用相同命令。安装/升级保留 `/var/lib/tailscale-egress/config.json` 和 Tailscale 登录状态，不自动切换出口、不重启共享服务。新功能涉及代理服务时，需在维护窗口手动切换/重建后验收，不能把“更新文件”当作运行中进程已经更新。
+
+## 新机器首次配置
+
+安装器只创建全局空配置；不会复制作者的出口地址或账号。工作壳默认使用安装时的已有登录用户，必要时安装用 `--user ubuntu` 指定已有用户。每个用户不需要另外配置。
+
+```bash
+# 首次只启动隔离登录服务，不启动应用 SOCKS，不选出口。
+egress init
+sudo tailscale --socket=/run/tailscale-egress/tailscaled.sock up \
+  --hostname=egress-proxy --accept-dns=false --netfilter-mode=off --advertise-exit-node=false
+
+# 填入你自己的 Tailscale IPv4，不是公网 IP；以下 100.x.y.z 必须替换。
+egress config node iphone 100.x.y.z
+egress config node ipad 100.x.y.z
+egress config node mudi 100.x.y.z
+egress config switch iphone
+egress switch iphone
+```
+
+出口设备须同一尾网、联网、宣告 exit node 并在 Tailscale 后台获准。不要启动已 masked 的系统 `tailscaled`，不要运行省略 `--socket` 的出口设置命令。
+
+## 日常命令
+
+```bash
+egress check                  # 只读：当前节点、公网 IP、运营商、隔离
+egress switch ipad            # 全局切换；所有工作壳的后续连接使用此出口
+egress shell                  # 默认用户，当前共享出口
+egress shell ubuntu           # 只改变登录用户，不创建私有出口
+egress config                 # 唯一全局配置
+egress config switch ipad     # 下次 switch 的默认目标，不立即切换
+egress config shell ubuntu    # 下次 shell 的默认用户
+exit                          # 离开本工作壳；清理其后台进程，保留共享代理
+```
+
+管理命令从普通 SSH 窗口执行，不在 `[work:...]` 壳内执行。多个管理窗口同时写配置/切换时，第二次操作返回 `75`，不会排队执行一个过时切换。`check` 返回 `0` 已确认、`1` 不安全、`2` 无法确认。
+
+紧急停止：在管理窗口执行 `sudo egress down`，它会停止共享服务并关闭**全部**工作壳。不要用它代替普通 `exit`。兼容的 `enter` 只进入当前共享出口；旧 `up/start` 会按全局旧偏好选路，新部署只用显式 `switch`。
+
+## 每次部署的手动验收
+
+在同一个工作壳重复：
+
+```bash
+curl -4 -fsS --max-time 15 https://ipinfo.io/json
+```
+
+1. 联网时：核对设备和预期供应商；不能是宿主机出口。
+2. 手动关闭出口设备网络：必须失败，不能回落宿主机。
+3. 恢复设备网络：同一工作壳的新请求恢复，无需重新进入。
+4. 另一个管理窗口 `egress switch ipad` 验收通过后，原工作壳的新请求使用新出口。
+5. `egress check` 的固定 IP 直连测试必须失败；只看到 DNS 失败不足以证明无泄漏。
+
+## 持续迭代
+
+```bash
+python3 tests/test_project.py
+bash scripts/build.sh
+```
+
+源码只在 `bin/egress` 维护，安装路径 `/usr/local/sbin/egress` 是部署产物。测试使用临时目录、模拟状态，不停本机服务、不测试作者的设备。人工验收不替代自动测试，自动测试也不替代真实设备断线验收。
+
+修改代码后更新 `ONEEGRESS_VERSION`、CHANGELOG 和测试；提交至 `main` 触发 CI；测试通过再创建并推送相同版本标签（如 `v0.1.1`）。标签工作流再次测试、打包并发布带 SHA256 的下载资产。不使用强推或移动已经发布的版本标签，不上传本机配置、状态、密钥。

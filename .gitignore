@@ -1,0 +1,6 @@
+/dist/
+*.state
+*.key
+*.pem
+config.local.json
+__pycache__/

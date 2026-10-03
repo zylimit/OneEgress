@@ -1,0 +1,945 @@
+#!/bin/bash
+# =============================================================================
+# OneEgress — 全机共享、断线不回落的工作出口。v0.1.0
+# 项目：https://github.com/zylimit/OneEgress
+#
+# egress --version                     查看版本
+# egress init                          首次创建隔离登录服务，不启动应用代理、不选出口
+# egress config                        查看全局配置
+# egress config node iphone 100.x.y.z   注册本机尾网中的候选出口
+# egress config switch ipad            保存默认目标（不切换）
+# egress switch [候选]                   全局切换并验收，影响全部工作壳
+# egress shell [用户]                    只选用户，不选出口；exit / Ctrl+D 退出
+# egress check                         实测公网 IPv4、运营商与隔离状态
+# sudo egress enter                    兼容入口，等价于 egress shell root
+# sudo egress down                     停止共享服务并关闭全部工作壳，SSH 路由不动
+#
+# 支持范围：Ubuntu 24.04 + systemd，宿主机管理默认网卡 eth0。
+# 系统 tailscaled 必须 inactive / masked；切勿取消 masked 或让它接管整机路由。
+# 所有 Tailscale 管理必须显式使用 /run/tailscale-egress/tailscaled.sock。
+# 共享 work / egress-router 命名空间；SOCKS 公网 TCP 绑定 tailscale-eg。
+# 代理 UID 的 IPv4/IPv6 内核防火墙拒绝非隧道公网流量，不自动回落宿主机。
+# 断网后壳仍可操作；设备恢复后新请求可恢复，失败请求是否重试取决于应用。
+# 所有配置/切换/启停操作全局互斥；忙时返回 75，请稍后重试。
+# check 返回 0=已确认，1=不安全，2=无法确认。公网地址可能随运营商 NAT 改变。
+# SSH 管理流量保留原网络；普通窗口不自动走工作出口。
+# sudo/root 主动绕过或修改隔离不在保证范围内。
+# 安装、首次登录、升级与验收流程见仓库 README.md；安装本身不切换出口。
+# =============================================================================
+# 同一文件也作为交互工作壳的 rcfile，不需要独立的启动文件。
+if [[ ${EGRESS_WORK_BOOTSTRAP:-} == 1 && $- == *i* && ${BASH_SOURCE[0]} != "$0" ]]; then
+  unset EGRESS_WORK_BOOTSTRAP
+  if [[ -r "$HOME/.bashrc" ]]; then
+    source "$HOME/.bashrc"
+  fi
+  export EGRESS_WORK_SHELL=1
+  # 固定共享代理，不接受按会话覆盖代理地址。
+  unset EGRESS_PROXY_URL
+  export ALL_PROXY="socks5h://10.200.0.1:1055"
+  export all_proxy="$ALL_PROXY"
+  export HTTPS_PROXY="$ALL_PROXY" https_proxy="$ALL_PROXY"
+  export HTTP_PROXY="$ALL_PROXY" http_proxy="$ALL_PROXY"
+  export NO_PROXY= no_proxy=
+  unset HISTFILE
+  PS1="[work:${USER}] ${PS1:-\u@\h:\w\$ }"
+  return 0
+fi
+
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+SOCK=/run/tailscale-egress/tailscaled.sock
+WORK_RC=/usr/local/sbin/egress
+DIR=/var/lib/tailscale-egress
+CONFIG_FILE=$DIR/config.json
+ONEEGRESS_VERSION=0.1.0
+UNIT=ts-egress
+PROXY_UNIT=egress-socks
+ROUTER=egress-router
+TUN=tailscale-eg
+UP_HOST=egress-uplink
+UP_NS=uplink
+UP_ADDR=10.201.0.2
+UP_GATEWAY=10.201.0.1
+NS=work
+VETH_HOST=veth-host
+VETH_NS=veth-ns
+HOST_ADDR=10.200.0.1
+NS_ADDR=10.200.0.2
+PROXY_PORT=1055
+PROXY="$HOST_ADDR:$PROXY_PORT"
+HOME_NODE=
+PREFER_FILE=/var/lib/tailscale-egress/prefer
+HOST_IP_FILE=/var/lib/tailscale-egress/host-ip
+CONTROL_LOCK=/run/tailscale-egress/control.lock
+CONTROL_FD=
+
+die() { echo "egress: $*" >&2; logger -t egress "$*"; exit 1; }
+log() { echo "egress: $*" >&2; logger -t egress "$*"; }
+ts() { tailscale --socket="$SOCK" "$@"; }
+svc() { systemctl "$1" "$2" >/dev/null 2>&1; }
+
+control_lock() {
+  command -v flock >/dev/null 2>&1 || { echo "需要 flock 保护全局出口操作。" >&2; return 2; }
+  mkdir -p /run/tailscale-egress || return 1
+  chmod 700 /run/tailscale-egress || return 1
+  exec {CONTROL_FD}>>"$CONTROL_LOCK" || return 1
+  chmod 600 "$CONTROL_LOCK" || { exec {CONTROL_FD}>&-; CONTROL_FD=; return 1; }
+  if flock -n "$CONTROL_FD"; then return 0; fi
+  exec {CONTROL_FD}>&-
+  CONTROL_FD=
+  echo "另一个窗口正在执行全局出口操作；本次未执行，请稍后重试。（返回码 75）" >&2
+  return 75
+}
+
+control_unlock() {
+  [[ -n ${CONTROL_FD:-} ]] || return 0
+  flock -u "$CONTROL_FD" || return 1
+  exec {CONTROL_FD}>&-
+  CONTROL_FD=
+}
+
+host_ip() { curl -4 -fsS --max-time 8 --noproxy '*' https://ifconfig.me 2>/dev/null || true; }
+default_dev() { ip -4 route show default | awk '{print $5; exit}'; }
+
+assert_host_route() {
+  local dev
+  dev=$(default_dev)
+  [[ $dev == eth0 ]] || die "host default dev is '${dev:-none}', refuse"
+  svc is-active tailscaled && die "system tailscaled is active, refuse"
+  [[ $(systemctl is-enabled tailscaled 2>/dev/null) == masked ]] || die "system tailscaled is not masked, refuse"
+  return 0
+}
+
+block_leak() {
+  iptables -C FORWARD -i "$VETH_HOST" -o eth0 -j DROP 2>/dev/null || iptables -I FORWARD -i "$VETH_HOST" -o eth0 -j DROP
+  iptables -t nat -C POSTROUTING -s 10.200.0.0/24 -o eth0 -j MASQUERADE 2>/dev/null && iptables -t nat -D POSTROUTING -s 10.200.0.0/24 -o eth0 -j MASQUERADE || true
+}
+
+router() { ip netns exec "$ROUTER" "$@"; }
+
+proxy_listening() {
+  svc is-active "$PROXY_UNIT" && router ss -ltn 2>/dev/null | grep -q "$HOST_ADDR:$PROXY_PORT"
+}
+
+hard_guard_ok() {
+  local family uid
+  [[ $(stat -c '%u:%a' /run/tailscale-egress 2>/dev/null) == 0:700 ]] || return 1
+  uid=$(id -u egress) || return 1
+  for family in iptables ip6tables; do
+    [[ $(router "$family" -S OUTPUT 2>/dev/null) == "-P OUTPUT ACCEPT"$'\n'"-A OUTPUT -m owner --uid-owner $uid -j EGRESS_PROXY" ]] || return 1
+    router "$family" -C OUTPUT -m owner --uid-owner "$uid" -j EGRESS_PROXY 2>/dev/null || return 1
+    [[ $(router "$family" -S EGRESS_PROXY 2>/dev/null) == "-N EGRESS_PROXY"$'\n'"-A EGRESS_PROXY -o $TUN -j ACCEPT"$'\n'"-A EGRESS_PROXY -d $NS_ADDR/32 -o $VETH_HOST -p tcp -m tcp --sport $PROXY_PORT -m conntrack --ctstate ESTABLISHED -j ACCEPT"$'\n'"-A EGRESS_PROXY -j REJECT --reject-with icmp-port-unreachable" ]] && continue
+    # IPv6 不允许工作网段的 IPv4 回包规则。
+    [[ $family == ip6tables && $(router "$family" -S EGRESS_PROXY 2>/dev/null) == "-N EGRESS_PROXY"$'\n'"-A EGRESS_PROXY -o $TUN -j ACCEPT"$'\n'"-A EGRESS_PROXY -j REJECT --reject-with icmp6-port-unreachable" ]] || return 1
+  done
+  [[ $(router iptables -S FORWARD) == '-P FORWARD DROP' ]] || return 1
+  [[ $(router ip6tables -S FORWARD) == '-P FORWARD DROP' ]] || return 1
+  router ip -4 addr show "$VETH_HOST" | grep -q "$HOST_ADDR/24" || return 1
+}
+
+ns_up() {
+  local family uid
+  uid=$(id -u egress) || die "缺少隔离代理用户 egress"
+  ip netns list | awk '{print $1}' | grep -qx "$ROUTER" || ip netns add "$ROUTER" || die "router namespace"
+  ip netns list | awk '{print $1}' | grep -qx "$NS" || ip netns add "$NS"
+  # 迁移现有工作壳的网关，保留 veth-ns 和已开启的 shell。
+  if ip link show "$VETH_HOST" >/dev/null 2>&1; then
+    ip link set "$VETH_HOST" netns "$ROUTER" || die "move work gateway"
+  fi
+  if ! router ip link show "$VETH_HOST" >/dev/null 2>&1; then
+    router ip link add "$VETH_HOST" type veth peer name "$VETH_NS" || die "create work link"
+    router ip link set "$VETH_NS" netns "$NS" || die "move work link"
+  fi
+  router ip addr show "$VETH_HOST" | grep -q "$HOST_ADDR/24" || router ip addr add "$HOST_ADDR/24" dev "$VETH_HOST" || die "work gateway"
+  router ip link set "$VETH_HOST" up || die "work link"
+  router ip link set lo up || die "router loopback"
+  ip netns exec "$NS" ip link set lo up
+  ip netns exec "$NS" ip addr show "$VETH_NS" | grep -q "$NS_ADDR" || ip netns exec "$NS" ip addr add "$NS_ADDR/24" dev "$VETH_NS"
+  ip netns exec "$NS" ip link set "$VETH_NS" up
+  ip netns exec "$NS" ip route replace "$HOST_ADDR/32" dev "$VETH_NS"
+  ip netns exec "$NS" ip route show default | grep -q . && die "work namespace has a default route, refuse"
+  block_leak
+  if ! ip link show "$UP_HOST" >/dev/null 2>&1; then
+    ip link add "$UP_HOST" type veth peer name "$UP_NS" || die "create transport link"
+    ip link set "$UP_NS" netns "$ROUTER" || die "move transport link"
+  fi
+  ip addr show "$UP_HOST" | grep -q "$UP_GATEWAY/30" || ip addr add "$UP_GATEWAY/30" dev "$UP_HOST" || die "transport gateway"
+  ip link set "$UP_HOST" up || die "transport link"
+  router ip addr show "$UP_NS" | grep -q "$UP_ADDR/30" || router ip addr add "$UP_ADDR/30" dev "$UP_NS" || die "transport address"
+  router ip link set "$UP_NS" up || die "router transport"
+  router ip route replace default via "$UP_GATEWAY" dev "$UP_NS" || die "router transport route"
+  # 主机仅为独立路由器提供 Tailscale 控制/加密传输，不接收 work 的转发。
+  iptables -C FORWARD -i "$UP_HOST" -o eth0 -s "$UP_ADDR/32" -j ACCEPT 2>/dev/null || iptables -I FORWARD -i "$UP_HOST" -o eth0 -s "$UP_ADDR/32" -j ACCEPT || die "transport forward"
+  iptables -C FORWARD -i eth0 -o "$UP_HOST" -d "$UP_ADDR/32" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -I FORWARD -i eth0 -o "$UP_HOST" -d "$UP_ADDR/32" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT || die "transport return"
+  iptables -t nat -C POSTROUTING -s "$UP_ADDR/32" -o eth0 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "$UP_ADDR/32" -o eth0 -j MASQUERADE || die "transport nat"
+  # 配置前停 SOCKS，防止刷新规则时产生空窗。只改独立 namespace 的规则。
+  svc is-active "$PROXY_UNIT" && die "refuse guard rewrite while proxy is running"
+  for family in iptables ip6tables; do
+    router "$family" -P FORWARD DROP || die "forward policy"
+    router "$family" -F FORWARD || die "forward guard"
+    router "$family" -N EGRESS_PROXY 2>/dev/null || true
+    router "$family" -F EGRESS_PROXY || die "proxy guard"
+    router "$family" -A EGRESS_PROXY -o "$TUN" -j ACCEPT || die "tunnel guard"
+    if [[ $family == iptables ]]; then
+      router "$family" -A EGRESS_PROXY -o "$VETH_HOST" -d "$NS_ADDR/32" -p tcp --sport "$PROXY_PORT" -m conntrack --ctstate ESTABLISHED -j ACCEPT || die "proxy reply guard"
+    fi
+    router "$family" -A EGRESS_PROXY -j REJECT || die "proxy reject"
+    router "$family" -C OUTPUT -m owner --uid-owner "$uid" -j EGRESS_PROXY 2>/dev/null || router "$family" -I OUTPUT -m owner --uid-owner "$uid" -j EGRESS_PROXY || die "proxy owner guard"
+  done
+  hard_guard_ok || die "hard guard verification failed"
+}
+
+proxy_up() {
+  mkdir -p "$DIR" /run/tailscale-egress || die "private state directories"
+  chmod 700 "$DIR" /run/tailscale-egress || die "private control directory"
+  if svc is-active "$UNIT" && [[ -S $SOCK ]] && proxy_listening && hard_guard_ok; then
+    return 0
+  fi
+  systemctl stop "$PROXY_UNIT" >/dev/null 2>&1 || true
+  systemctl stop "$UNIT" >/dev/null 2>&1 || true
+  pkill -f 'tailscaled --tun=userspace-networking --statedir=/var/lib/tailscale-egress' >/dev/null 2>&1 || true
+  ns_up
+  mkdir -p /run/tailscale-egress
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:1\n' > /run/tailscale-egress/resolv.conf
+  # 首次从 userspace 迁移时先禁用系统 DNS/防火墙管理；此阶段没有 SOCKS。
+  # 否则原来的 accept-dns=true 可能通过宿主机 D-Bus 修改 SSH 一侧的 DNS。
+  systemd-run --unit="$UNIT" --collect --property="NetworkNamespacePath=/run/netns/$ROUTER" \
+    --property=BindReadOnlyPaths=/run/tailscale-egress/resolv.conf:/etc/resolv.conf \
+    /usr/sbin/tailscaled --tun=userspace-networking --statedir="$DIR" --socket="$SOCK" || die "prepare isolated preferences"
+  local i ready=false
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if ts status --json >/dev/null 2>&1; then ready=true; break; fi
+    sleep 0.4
+  done
+  if ! $ready || ! ts set --accept-dns=false --netfilter-mode=off --advertise-exit-node=false; then
+    systemctl stop "$UNIT" >/dev/null 2>&1 || true
+    die "prepare preferences failed; SOCKS remains stopped"
+  fi
+  systemctl stop "$UNIT" || die "stop preparation daemon"
+  systemd-run --unit="$UNIT" --collect --property="NetworkNamespacePath=/run/netns/$ROUTER" \
+    --property=BindReadOnlyPaths=/run/tailscale-egress/resolv.conf:/etc/resolv.conf \
+    /usr/sbin/tailscaled --tun="$TUN" --statedir="$DIR" --socket="$SOCK" || die "failed to start isolated tailscaled"
+  for i in {1..25}; do
+    [[ -S $SOCK ]] && router ip link show "$TUN" >/dev/null 2>&1 &&
+      ts status --json 2>/dev/null | jq -e '.BackendState == "Running" or .BackendState == "NeedsLogin" or .BackendState == "Stopped"' >/dev/null && break
+    sleep 0.4
+  done
+  [[ -S $SOCK ]] || die "socket did not appear"
+  chmod 600 "$SOCK" || die "protect local control socket"
+  if ! ts status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null; then
+    echo "egress-proxy 尚未就绪，SOCKS 保持关闭；状态："
+    ts status --json 2>/dev/null | jq '{BackendState,Health}'
+    exit 2
+  fi
+  ts set --accept-dns=false --netfilter-mode=off --advertise-exit-node=false || die "isolated tailscale preferences"
+  # 内核防火墙就绪之后才允许启动代理；限制 UID，禁止自行修改隔离规则。
+  hard_guard_ok || die "hard guard changed during tailscaled startup"
+  systemd-run --unit="$PROXY_UNIT" --collect --property="NetworkNamespacePath=/run/netns/$ROUTER" \
+    --property=BindReadOnlyPaths=/run/tailscale-egress/resolv.conf:/etc/resolv.conf \
+    --property=User=egress --property=Group=egress --property=NoNewPrivileges=yes \
+    --property='RestrictAddressFamilies=AF_INET AF_INET6' --property=ProtectHome=yes \
+    --property=ProtectSystem=strict --property=PrivateTmp=yes --property=RestrictNamespaces=yes \
+    --property=AmbientCapabilities=CAP_NET_RAW --property=CapabilityBoundingSet=CAP_NET_RAW \
+    /usr/local/sbin/egress __socks || die "failed to start guarded SOCKS"
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    proxy_listening && return 0
+    sleep 0.2
+  done
+  die "guarded proxy not listening"
+}
+
+cmd_init() {
+  [[ $# -eq 0 ]] || { echo "用法: egress init（不接受出口参数）" >&2; return 2; }
+  assert_host_route
+  if svc is-active "$UNIT" && [[ -S $SOCK ]]; then
+    echo "隔离 Tailscale 服务已存在，未重启、未切换出口；首次登录见 README。"
+    return 0
+  fi
+  svc is-active "$PROXY_UNIT" && { echo "SOCKS 仍在运行；请用 switch 恢复共享服务，不执行首次初始化。" >&2; return 2; }
+  mkdir -p "$DIR" /run/tailscale-egress || return 1
+  chmod 700 "$DIR" /run/tailscale-egress || return 1
+  ns_up
+  printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:1\n' > /run/tailscale-egress/resolv.conf
+  # 首次登录只用 userspace daemon，绝不启用 SOCKS；登录后 switch 再迁移到内核 TUN。
+  systemd-run --unit="$UNIT" --collect --property="NetworkNamespacePath=/run/netns/$ROUTER" \
+    --property=BindReadOnlyPaths=/run/tailscale-egress/resolv.conf:/etc/resolv.conf \
+    /usr/sbin/tailscaled --tun=userspace-networking --statedir="$DIR" --socket="$SOCK" || return 2
+  local i
+  for i in {1..25}; do
+    if [[ -S $SOCK ]] && ts status --json >/dev/null 2>&1; then
+      chmod 600 "$SOCK" || return 1
+      echo "初始化完成：只运行隔离登录服务，不启动应用代理、不选出口。"
+      echo "首次登录请执行："
+      echo "sudo tailscale --socket=$SOCK up --hostname=egress-proxy --accept-dns=false --netfilter-mode=off --advertise-exit-node=false"
+      return 0
+    fi
+    sleep 0.4
+  done
+  echo "隔离登录服务尚未就绪；未启动 SOCKS，请检查 ts-egress 日志。" >&2
+  return 2
+}
+
+# 唯一代码文件内置 SOCKS CONNECT 服务。DNS 受 UID 防火墙约束；TCP 再绑定 TUN。
+run_socks() {
+  exec python3 - "$HOST_ADDR" "$PROXY_PORT" "$TUN" <<'PY'
+import ipaddress, select, socket, socketserver, struct, sys, threading
+HOST, PORT, TUN = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+LIMIT = threading.BoundedSemaphore(64)
+def exact(s, size):
+    data = b''
+    while len(data) < size:
+        chunk = s.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError('incomplete SOCKS request')
+        data += chunk
+    return data
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client, remote = self.request, None
+        client.settimeout(12)
+        try:
+            version, count = exact(client, 2)
+            methods = exact(client, count)
+            if version != 5 or 0 not in methods:
+                client.sendall(b'\x05\xff')
+                return
+            client.sendall(b'\x05\x00')
+            version, command, reserved, kind = exact(client, 4)
+            if version != 5 or command != 1 or reserved != 0:
+                raise ValueError('CONNECT only')
+            if kind == 1:
+                host = socket.inet_ntop(socket.AF_INET, exact(client, 4))
+            elif kind == 4:
+                host = socket.inet_ntop(socket.AF_INET6, exact(client, 16))
+            elif kind == 3:
+                host = exact(client, exact(client, 1)[0]).decode('ascii')
+            else:
+                raise ValueError('address type')
+            port = struct.unpack('!H', exact(client, 2))[0]
+            family = socket.AF_INET6 if kind == 4 else socket.AF_INET
+            # 不使用宿主机的 resolver：服务独立 mount/net namespace，DNS 只能走 TUN。
+            addresses = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+            for af, socktype, proto, _, address in addresses:
+                if not ipaddress.ip_address(address[0]).is_global:
+                    continue
+                candidate = socket.socket(af, socktype, proto)
+                try:
+                    candidate.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, TUN.encode() + b'\0')
+                    candidate.settimeout(7)
+                    candidate.connect(address)
+                    remote = candidate
+                    break
+                except OSError:
+                    candidate.close()
+            if remote is None:
+                raise ConnectionError('no tunnel connection')
+            client.sendall(b'\x05\x00\x00\x01' + b'\x00' * 6)
+            client.settimeout(20)
+            remote.settimeout(20)
+            readers = [client, remote]
+            while readers:
+                ready, _, _ = select.select(readers, [], [], 300)
+                if not ready:
+                    break
+                for source in ready:
+                    target = remote if source is client else client
+                    data = source.recv(65536)
+                    if data:
+                        target.sendall(data)
+                    else:
+                        readers.remove(source)
+                        target.shutdown(socket.SHUT_WR)
+        except (OSError, ValueError, UnicodeError):
+            if remote is None:
+                try:
+                    client.sendall(b'\x05\x04\x00\x01' + b'\x00' * 6)
+                except OSError:
+                    pass
+        finally:
+            if remote is not None:
+                remote.close()
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+    def process_request(self, request, address):
+        if not LIMIT.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            LIMIT.release()
+            raise
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            LIMIT.release()
+with Server((HOST, PORT), Handler) as server:
+    server.serve_forever()
+PY
+}
+
+ns_ip() {
+  ip netns exec "$NS" curl -4 -fsS --max-time 15 \
+    --socks5-hostname "$PROXY" https://ifconfig.me 2>/dev/null || true
+}
+
+use_node() {
+  local node=$1 ip host
+  ts set --exit-node="$node" --exit-node-allow-lan-access=true --advertise-exit-node=false || return 1
+  sleep 2
+  ip=$(ns_ip)
+  host=$(cat "$HOST_IP_FILE" 2>/dev/null || host_ip)
+  [[ -n $ip ]] || return 1
+  [[ -n $host && $ip == "$host" ]] && return 1
+  echo "$ip"
+}
+
+pick_exit() {
+  local prefer node ip order config mudi phone
+  config=$(load_configuration) || return 1
+  HOME_NODE=$(jq -r '.nodes["mudi-home"] // empty' <<< "$config")
+  mudi=$(jq -r '.nodes.mudi // empty' <<< "$config")
+  phone=$(jq -r '.nodes.iphone // empty' <<< "$config")
+  prefer=$(cat "$PREFER_FILE" 2>/dev/null || echo mudi)
+  order=("$mudi" "$phone")
+  [[ $prefer == phone ]] && order=("$phone" "$mudi")
+  [[ $prefer == home ]] && order=("$HOME_NODE" "$mudi" "$phone")
+  for node in "${order[@]}"; do
+    [[ -n $node ]] || continue
+    if ip=$(use_node "$node"); then
+      log "exit $node -> $ip"
+      echo "$ip"
+      return 0
+    fi
+    log "exit $node failed"
+  done
+  # 出口失败时停代理，不能清空 exit node 后让 SOCKS 回落到主机公网。
+  systemctl stop "$PROXY_UNIT" "$UNIT" >/dev/null 2>&1 || true
+  return 1
+}
+
+cmd_enter() {
+  [[ $# -eq 0 ]] || { echo "用法: sudo egress enter（只进入当前共享出口，不接受设备参数）" >&2; return 2; }
+  echo "旧入口 enter 只进入当前共享出口，不切换节点；等价于 egress shell root。"
+  cmd_shell root
+}
+
+shell_account() {
+  local name=$1 account shell_name shell_password shell_uid shell_gid shell_comment shell_home shell_login
+  [[ $name =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*\$?$ ]] || { echo "无效用户名: $name" >&2; return 2; }
+  account=$(getent passwd "$name") || { echo "用户不存在: $name" >&2; return 2; }
+  IFS=: read -r shell_name shell_password shell_uid shell_gid shell_comment shell_home shell_login <<< "$account"
+  if [[ ! -x $shell_login || $shell_login == */nologin || $shell_login == */false ]]; then
+    echo "用户 $name 没有可用的交互 shell。" >&2
+    return 2
+  fi
+  printf '%s\n' "$account"
+}
+
+cleanup_work_scope() {
+  local scope=$1 state
+  # 精确清理本次创建的 scope，不杀命名空间中的其他用户进程。
+  systemctl stop "$scope" >/dev/null 2>&1 || true
+  state=$(systemctl show --property=ActiveState --value "$scope" 2>/dev/null || true)
+  case "$state" in
+    active|activating|deactivating)
+      echo "会话 $scope 尚未清理完成；请在管理窗口检查该会话。" >&2
+      return 1 ;;
+  esac
+  echo "已退出工作壳：本会话进程已清理，共享代理和出口保留。"
+}
+
+run_work_shell() (
+  local shell_user=${1:-root} account shell_name shell_password shell_uid shell_gid shell_comment shell_home shell_login
+  local work_scope scope_nonce worker_pid rc=0
+  account=$(shell_account "$shell_user") || return 2
+  IFS=: read -r shell_name shell_password shell_uid shell_gid shell_comment shell_home shell_login <<< "$account"
+  [[ -r $WORK_RC ]] || { echo "工作壳启动文件缺失: $WORK_RC" >&2; return 2; }
+  # 尽量保留工作目录；目标用户无法访问时退到其主目录，仅改变此子进程。
+  if ! sudo -n -H -u "$shell_user" -- test -x "$PWD"; then
+    cd -- "$shell_home" || { echo "无法进入 $shell_user 的主目录。" >&2; return 2; }
+  fi
+  IFS= read -r scope_nonce < /proc/sys/kernel/random/uuid || return 2
+  work_scope="egress-shell-${shell_uid}-${BASHPID}-${scope_nonce}.scope"
+  trap 'cleanup_work_scope "$work_scope" || exit 1' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 143' TERM
+  # Ctrl+C 交给交互壳处理；等待被打断时继续等待，不关闭工作壳。
+  trap ':' INT
+  echo "工作壳用户: $shell_user；退出: exit / Ctrl+D"
+  # 非交互 Bash 的后台任务默认忽略 INT/QUIT；恢复它们供终端正常转发。
+  env --default-signal=INT,QUIT systemd-run --scope --quiet --collect --expand-environment=no --unit="$work_scope" \
+    --property=KillMode=control-group --property=TimeoutStopSec=3s \
+    ip netns exec "$NS" sudo -n -H -u "$shell_user" -- env \
+      EGRESS_WORK_SHELL=1 EGRESS_WORK_BOOTSTRAP=1 \
+      ALL_PROXY="socks5h://$PROXY" all_proxy="socks5h://$PROXY" \
+      HTTPS_PROXY="socks5h://$PROXY" https_proxy="socks5h://$PROXY" \
+      HTTP_PROXY="socks5h://$PROXY" http_proxy="socks5h://$PROXY" \
+      NO_PROXY= no_proxy= HISTFILE=/dev/null \
+      bash --noprofile --rcfile "$WORK_RC" -i <&0 &
+  worker_pid=$!
+  while true; do
+    if wait "$worker_pid"; then rc=0; else rc=$?; fi
+    kill -0 "$worker_pid" 2>/dev/null || break
+  done
+  return "$rc"
+)
+
+guard_work_context() {
+  [[ ${EGRESS_WORK_SHELL:-} == 1 ]] || return 0
+  case "${1:-}" in
+    check|switch|shell|config|init|enter|up|start|down|status|mudi|phone|home)
+      echo "当前已在工作壳中；请用 exit 返回原管理窗口，再运行 egress ${1:-help}。" >&2
+      return 2 ;;
+  esac
+}
+
+valid_tail_ipv4() {
+  local first second third fourth
+  valid_ipv4 "$1" || return 1
+  IFS=. read -r first second third fourth <<< "$1"
+  [[ $first == 100 ]] && (( 10#$second >= 64 && 10#$second <= 127 ))
+}
+
+validate_configuration() {
+  local config=$1 name address
+  if ! jq -e '. as $cfg |
+    type == "object" and .version == 1 and
+    (.default_node | type == "string") and
+    (.default_user | type == "string") and
+    (.default_user | test("^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$")) and
+    (.nodes | type == "object") and
+    ((.nodes | has($cfg.default_node)) or
+      (($cfg.default_node == "") and (.nodes | length == 0))) and
+    (.nodes | all(to_entries[];
+      (.key | test("^[a-zA-Z][a-zA-Z0-9_-]*$")) and (.value | type == "string")))' \
+    >/dev/null 2>&1 <<< "$config"; then
+    echo "配置格式无效: $CONFIG_FILE" >&2
+    return 2
+  fi
+  while IFS=$'\t' read -r name address; do
+    valid_tail_ipv4 "$address" || { echo "候选 $name 的地址不是有效 Tailscale IPv4: $address" >&2; return 2; }
+  done < <(jq -r '.nodes | to_entries[] | [.key, .value] | @tsv' <<< "$config")
+}
+
+load_configuration() {
+  local config
+  command -v jq >/dev/null 2>&1 || { echo "需要 jq 读取配置。" >&2; return 2; }
+  config=$(jq -c . "$CONFIG_FILE" 2>/dev/null) || { echo "配置不可读或不是有效 JSON: $CONFIG_FILE" >&2; return 2; }
+  validate_configuration "$config" || return 2
+  printf '%s\n' "$config"
+}
+
+save_configuration() (
+  local config=$1 config_temp
+  validate_configuration "$config" || return 2
+  config_temp=$(mktemp "$DIR/.config.XXXXXX") || return 2
+  trap 'rm -f -- "$config_temp"' EXIT
+  jq . <<< "$config" > "$config_temp" || return 2
+  chmod 600 "$config_temp" || return 2
+  mv -f -- "$config_temp" "$CONFIG_FILE" || return 2
+)
+
+cmd_config() {
+  local config updated
+  config=$(load_configuration) || return 2
+  [[ $# -gt 0 ]] || { jq . <<< "$config"; return; }
+  case "$1" in
+    switch)
+      [[ $# -eq 2 ]] || { echo "用法: egress config switch <候选名称>" >&2; return 2; }
+      jq -e --arg name "$2" '.nodes | has($name)' >/dev/null <<< "$config" || { echo "未知候选: $2；先用 config node 配置。" >&2; return 2; }
+      updated=$(jq -c --arg name "$2" '.default_node = $name' <<< "$config") || return 2
+      save_configuration "$updated" || return 2
+      echo "默认切换目标已保存: $2；实际切换请调用 egress switch。" ;;
+    shell)
+      [[ $# -eq 2 ]] || { echo "用法: egress config shell <用户>" >&2; return 2; }
+      shell_account "$2" >/dev/null || return 2
+      updated=$(jq -c --arg user "$2" '.default_user = $user' <<< "$config") || return 2
+      save_configuration "$updated" || return 2
+      echo "默认工作壳用户已保存: $2；下次 egress shell 生效。" ;;
+    node)
+      [[ $# -eq 3 && $2 =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]] || { echo "用法: egress config node <名称> <Tailscale IPv4>" >&2; return 2; }
+      valid_tail_ipv4 "$3" || { echo "不是有效 Tailscale IPv4: $3" >&2; return 2; }
+      updated=$(jq -c --arg name "$2" --arg address "$3" '.nodes[$name] = $address | if .default_node == "" then .default_node = $name else . end' <<< "$config") || return 2
+      save_configuration "$updated" || return 2
+      echo "候选配置已保存: $2 -> $3；不注册设备、不探测、不切换网络。" ;;
+    *) echo "用法: egress config [switch <名称>|shell <用户>|node <名称> <Tailscale IPv4>]" >&2; return 2 ;;
+  esac
+}
+
+cmd_shell() {
+  [[ $# -le 1 ]] || { echo "用法: egress shell [用户]" >&2; return 2; }
+  local rc config shell_user
+  config=$(load_configuration) || return 2
+  shell_user=${1:-$(jq -r '.default_user' <<< "$config")}
+  shell_account "$shell_user" >/dev/null || return 2
+  if cmd_check; then
+    control_unlock || return 1
+    echo "进入全机共享出口的工作壳；exit 只离开工作壳。"
+    run_work_shell "$shell_user"
+  else
+    rc=$?
+    echo "当前出口未通过检查，未进入工作壳；请先手动 egress switch <设备>。" >&2
+    return "$rc"
+  fi
+}
+
+cmd_switch() {
+  local target address status peer backend rc config
+  [[ $# -le 1 ]] || { echo "用法: egress switch [候选名称]" >&2; return 2; }
+  config=$(load_configuration) || return 2
+  target=${1:-$(jq -r '.default_node' <<< "$config")}
+  [[ -n $target ]] || { echo "尚未配置出口；先执行 egress config node <名称> <Tailscale IPv4>。" >&2; return 2; }
+  if ! jq -e --arg target "$target" '.nodes | has($target)' >/dev/null <<< "$config"; then
+    case "$target" in phone) target=iphone ;; mudi-travel) target=mudi ;; esac
+  fi
+  address=$(jq -r --arg target "$target" '.nodes[$target] // empty' <<< "$config")
+  [[ -n $address ]] || { echo "未知候选 '$target'；用 egress config 查看，或 config node 配置。" >&2; return 2; }
+  assert_host_route || return 1
+  # 显式 switch 可恢复受硬隔离保护的服务，不自动选择其他节点。
+  proxy_up || return 2
+  hard_guard_ok || { echo "代理硬隔离未就绪，拒绝切换。" >&2; return 1; }
+  if ! status=$(ts status --json 2>/dev/null) ||
+     ! jq -e 'type == "object"' >/dev/null 2>&1 <<< "$status"; then
+    echo "无法读取 Tailscale 状态，未切换。" >&2
+    return 2
+  fi
+  backend=$(jq -r '.BackendState // "unknown"' <<< "$status")
+  peer=$(jq -c --arg address "$address" '[ (.Peer // {})[] | select(any(.TailscaleIPs[]?; . == $address)) ][0] // empty' <<< "$status")
+  if [[ -z $peer ]]; then
+    echo "$target ($address) 不在当前 Tailscale 设备列表中，未切换。" >&2
+    return 2
+  fi
+  if [[ $backend != Running ]] || ! jq -e '.Online == true and .ExitNodeOption == true' >/dev/null <<< "$peer"; then
+    echo "$target 尚未就绪，未切换：online=$(jq -r '.Online' <<< "$peer")；可作出口=$(jq -r '.ExitNodeOption' <<< "$peer")；Tailscale=$backend" >&2
+    echo "请确认设备联网、开启 Run as Exit Node，并在 Tailscale 后台批准。" >&2
+    return 2
+  fi
+  if ! ts set --exit-node="$address" --exit-node-allow-lan-access=true --advertise-exit-node=false; then
+    echo "设置 $target 出口失败；请用 egress check 确认当前状态。" >&2
+    return 2
+  fi
+  echo "已指定全局出口: $target ($address)；所有工作壳共用；开始验收，不自动尝试其他设备。"
+  if cmd_check; then
+    # 除了能出网，还要确认验收后的节点确实是调用者指定的目标。
+    if status=$(ts status --json 2>/dev/null) &&
+       jq -e --arg address "$address" 'any((.Peer // {})[]; .ExitNode == true and any(.TailscaleIPs[]?; . == $address))' >/dev/null 2>&1 <<< "$status"; then
+      echo "切换验收通过: $target"
+      return 0
+    fi
+    echo "目标节点未保持为 $target，切换验收未通过；请重新检查。" >&2
+    return 2
+  else
+    rc=$?
+    echo "$target 已被指定，但切换验收未通过；未自动回退，请根据检查结果处理。" >&2
+    return "$rc"
+  fi
+}
+
+cmd_down() {
+  systemctl stop "$PROXY_UNIT" "$UNIT" >/dev/null 2>&1 || true
+  pkill -f 'tailscaled --tun=userspace-networking --statedir=/var/lib/tailscale-egress' >/dev/null 2>&1 || true
+  ip netns pids "$NS" 2>/dev/null | xargs -r kill || true
+  ip netns del "$NS" 2>/dev/null || true
+  ip netns del "$ROUTER" 2>/dev/null || true
+  ip link del "$UP_HOST" 2>/dev/null || true
+  ip link del "$VETH_HOST" 2>/dev/null || true
+  iptables -D FORWARD -i "$VETH_HOST" -o eth0 -j DROP 2>/dev/null || true
+  iptables -D FORWARD -i "$UP_HOST" -o eth0 -s "$UP_ADDR/32" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i eth0 -o "$UP_HOST" -d "$UP_ADDR/32" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -s "$UP_ADDR/32" -o eth0 -j MASQUERADE 2>/dev/null || true
+  rm -f /run/tailscale-egress/resolv.conf
+  echo "stopped"
+  echo "ssh $(host_ip)"
+}
+
+cmd_status() {
+  local en ac
+  # systemctl 对 masked/inactive 返回非零，但仍会打印状态。
+  en=$(systemctl is-enabled tailscaled 2>/dev/null || true)
+  ac=$(systemctl is-active tailscaled 2>/dev/null || true)
+  echo "unit: $(systemctl is-active "$UNIT" 2>/dev/null || true)"
+  echo "system-tailscaled: $en / $ac"
+  echo "default: $(ip -4 route show default | head -n 1)"
+  echo "prefer: $(cat "$PREFER_FILE" 2>/dev/null || echo mudi)"
+  if ip netns list | awk '{print $1}' | grep -qx "$NS"; then
+    echo -n "work: "
+    ns_ip || true
+    echo
+    echo -n "work-default: "
+    ip netns exec "$NS" ip route show default || true
+  else
+    echo "work: down"
+  fi
+  echo -n "ssh: "
+  host_ip
+  echo
+}
+
+valid_ipv4() {
+  local octet
+  local -a octets
+  [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r -a octets <<< "$1"
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+cmd_check() {
+  local status peer backend node node_ip online option selected=false after before_state after_state selected_count
+  local config
+  local host info public_ip country org secondary info_rc secondary_rc
+  local unit en ac dev route4 route6 direct_rc=0 unsafe=false confirmed=true
+  local ns_exists=false
+  local -a reasons=()
+
+  command -v jq >/dev/null 2>&1 || { echo "egress check: 需要 jq" >&2; return 2; }
+  echo "检查时间: $(date -Is)"
+  echo "检查范围: 宿主机和隔离工作壳 $NS（不是调用者浏览器的出口）"
+  echo "出口策略: 所有工作壳共用一个全局出口节点，不按用户或窗口分配"
+  if config=$(load_configuration 2>/dev/null); then
+    echo "配置默认值: switch=$(jq -r '.default_node' <<< "$config")；shell=$(jq -r '.default_user' <<< "$config")（不代表当前出口）"
+  else
+    echo "配置默认值: 不可读；仍继续检查当前出口"
+  fi
+
+  unit=$(systemctl is-active "$UNIT" 2>/dev/null || true)
+  en=$(systemctl is-enabled tailscaled 2>/dev/null || true)
+  ac=$(systemctl is-active tailscaled 2>/dev/null || true)
+  dev=$(default_dev)
+  echo "隔离 Tailscale: ${unit:-unknown}；SOCKS: $(systemctl is-active "$PROXY_UNIT" 2>/dev/null || true)；系统 tailscaled: ${en:-unknown} / ${ac:-unknown}"
+  echo "宿主机默认网卡: ${dev:-无}"
+  if [[ $dev != eth0 || $en != masked || $ac != inactive ]]; then
+    unsafe=true
+    reasons+=("宿主机路由或系统 tailscaled 状态不符合隔离要求")
+  fi
+
+  if status=$(ts status --json 2>/dev/null) && jq -e 'type == "object"' >/dev/null 2>&1 <<< "$status"; then
+    backend=$(jq -r '.BackendState // "unknown"' <<< "$status")
+    selected_count=$(jq '[ (.Peer // {})[] | select(.ExitNode == true) ] | length' <<< "$status")
+    if (( selected_count > 1 )); then
+      unsafe=true
+      reasons+=("发现多个选中的出口节点，违反全局唯一出口约束")
+    fi
+    peer=$(jq -c '[ (.Peer // {})[] | select(.ExitNode == true) ][0] // empty' <<< "$status")
+    if [[ -n $peer ]]; then
+      selected=true
+      node=$(jq -r 'if (.DNSName // "") != "" then (.DNSName | split(".")[0]) else (.HostName // .ID // "unknown") end' <<< "$peer")
+      node_ip=$(jq -r '[.TailscaleIPs[]? | select(contains(":") | not)][0] // "unknown"' <<< "$peer")
+      online=$(jq -r '.Online' <<< "$peer")
+      option=$(jq -r '.ExitNodeOption' <<< "$peer")
+      echo "当前选中节点: $node ($node_ip)"
+      echo "节点状态: online=$online；可作出口=$option；Tailscale=$backend"
+      if [[ $online != true || $option != true || $backend != Running ]]; then
+        confirmed=false
+        reasons+=("选中的节点当前未就绪")
+      fi
+    else
+      echo "当前选中节点: 无法从 Tailscale 状态确认"
+      confirmed=false
+      reasons+=("未确认选中的出口节点")
+    fi
+  else
+    echo "当前选中节点: 无法读取 Tailscale 状态"
+    confirmed=false
+    reasons+=("隔离 Tailscale 状态不可读")
+  fi
+
+  host=$(host_ip)
+  if valid_ipv4 "$host"; then
+    echo "宿主机实测 IPv4 (ifconfig.me): $host"
+  else
+    host=
+    confirmed=false
+    reasons+=("无法实测宿主机公网 IPv4")
+    echo "宿主机实测 IPv4: 未确认"
+  fi
+
+  ip netns list | awk '{print $1}' | grep -qx "$NS" && ns_exists=true
+  if $ns_exists; then
+    route4=$(ip netns exec "$NS" ip -4 route show default)
+    route6=$(ip netns exec "$NS" ip -6 route show default)
+    if [[ -n $route4 || -n $route6 ]]; then
+      unsafe=true
+      reasons+=("工作壳存在 IPv4 或 IPv6 默认路由")
+    fi
+    if ! iptables -C FORWARD -i "$VETH_HOST" -o eth0 -j DROP 2>/dev/null; then
+      unsafe=true
+      reasons+=("工作壳到 eth0 的转发阻断规则缺失")
+    fi
+    if ip netns exec "$NS" ip -4 route get 1.1.1.1 >/dev/null 2>&1 ||
+       ip netns exec "$NS" ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then
+      unsafe=true
+      reasons+=("工作壳存在绕过代理到公网测试地址的路由")
+    fi
+    # 固定目的 IP，排除 DNS 失败导致的假阻断；清空代理设置。
+    ip netns exec "$NS" curl -4 -fsS --connect-timeout 3 --max-time 5 \
+      --proxy '' --noproxy '*' --resolve one.one.one.one:443:1.1.1.1 \
+      https://one.one.one.one/cdn-cgi/trace >/dev/null 2>&1 || direct_rc=$?
+    if (( direct_rc == 0 )); then
+      unsafe=true
+      reasons+=("工作壳绕过代理直连成功")
+      echo "工作壳直连测试 (IPv4): 成功，存在泄漏"
+    else
+      echo "工作壳直连测试 (IPv4): 未成功，curl=$direct_rc"
+    fi
+    echo "工作壳默认路由: IPv4=${route4:-无}；IPv6=${route6:-无}"
+  else
+    confirmed=false
+    reasons+=("工作壳命名空间不存在")
+    echo "工作壳: 未运行，未执行直连测试"
+  fi
+
+  if hard_guard_ok; then
+    echo "代理硬隔离: IPv4/IPv6 仅允许隧道公网连接；工作网段回包单独放行"
+  elif proxy_listening; then
+    unsafe=true
+    reasons+=("SOCKS 已运行，但代理硬隔离规则不完整")
+  else
+    confirmed=false
+    reasons+=("代理硬隔离未就绪；SOCKS 未运行")
+  fi
+  if $ns_exists && [[ $unit == active && -S $SOCK ]] && proxy_listening && hard_guard_ok; then
+    if info=$(ip netns exec "$NS" curl -4 -fsS --connect-timeout 5 --max-time 12 \
+      --noproxy '' --socks5-hostname "$PROXY" https://ipinfo.io/json 2>&1); then
+      info_rc=0
+    else
+      info_rc=$?
+      printf '公网探测失败 (ipinfo.io): curl=%s\n错误信息: %s\n' "$info_rc" "$info"
+      info=
+    fi
+    public_ip=$(jq -r '.ip // empty' <<< "$info" 2>/dev/null || true)
+    country=$(jq -r '.country // "未提供"' <<< "$info" 2>/dev/null || true)
+    org=$(jq -r '.org // "未提供"' <<< "$info" 2>/dev/null || true)
+    if valid_ipv4 "$public_ip"; then
+      echo "工作壳实测 IPv4 (ipinfo.io): $public_ip"
+      echo "出口归属: $country；$org"
+      if [[ $public_ip == "$host" || $org == AS132203\ * ]]; then
+        unsafe=true
+        reasons+=("工作壳实测出口为宿主机或腾讯云网络")
+      fi
+    else
+      confirmed=false
+      if (( info_rc != 0 )); then
+        reasons+=("ipinfo.io 公网探测失败，curl=$info_rc")
+      else
+        reasons+=("ipinfo.io 请求成功，但未返回有效的工作壳公网 IPv4")
+      fi
+      echo "工作壳实测 IPv4 (ipinfo.io): 未确认"
+    fi
+    if secondary=$(ip netns exec "$NS" curl -4 -fsS --connect-timeout 5 --max-time 10 \
+      --noproxy '' --socks5-hostname "$PROXY" https://ifconfig.me 2>&1); then
+      secondary_rc=0
+    else
+      secondary_rc=$?
+      printf '公网探测失败 (ifconfig.me): curl=%s\n错误信息: %s\n' "$secondary_rc" "$secondary"
+      secondary=
+    fi
+    if valid_ipv4 "$secondary"; then
+      echo "工作壳实测 IPv4 (ifconfig.me): $secondary"
+      if [[ $secondary == "$host" ]]; then
+        unsafe=true
+        reasons+=("工作壳与宿主机在同一检测站点的出口 IP 相同")
+      fi
+      if valid_ipv4 "$public_ip" && [[ $secondary != "$public_ip" ]]; then
+        echo "地址差异: 两个检测站点观察到不同 IP，不能据此承诺所有目标使用同一 IP"
+      fi
+    else
+      confirmed=false
+      if (( secondary_rc != 0 )); then
+        reasons+=("ifconfig.me 公网探测失败，curl=$secondary_rc")
+      else
+        reasons+=("ifconfig.me 请求成功，但未返回有效的工作壳公网 IPv4")
+      fi
+      echo "工作壳实测 IPv4 (ifconfig.me): 未确认"
+    fi
+    if ! $selected && { valid_ipv4 "$public_ip" || valid_ipv4 "$secondary"; }; then
+      unsafe=true
+      reasons+=("未确认出口节点，但 SOCKS 仍可出网")
+    fi
+  else
+    confirmed=false
+    reasons+=("代理服务、套接字或 SOCKS 监听未就绪")
+    echo "工作壳实测 IPv4: 未确认，代理未就绪"
+  fi
+
+  # 网络探测需要数秒；期间若别人切换了节点，不能把两次状态混成一次确认。
+  if [[ -n ${status:-} ]]; then
+    before_state=$(jq -c '{BackendState, ExitNodeStatus, Selected: [(.Peer // {})[] | select(.ExitNode == true) | {ID, Online, ExitNodeOption}]}' <<< "$status" 2>/dev/null || true)
+    after=$(ts status --json 2>/dev/null || true)
+    after_state=$(jq -c '{BackendState, ExitNodeStatus, Selected: [(.Peer // {})[] | select(.ExitNode == true) | {ID, Online, ExitNodeOption}]}' <<< "$after" 2>/dev/null || true)
+    if [[ -z $after_state || $before_state != "$after_state" ]]; then
+      confirmed=false
+      reasons+=("检查期间节点状态发生变化或不可读，请重新检查")
+    fi
+  fi
+
+  if (( ${#reasons[@]} > 0 )); then
+    printf '说明: %s\n' "${reasons[@]}"
+  fi
+  if $unsafe; then
+    echo "结论: 不安全（返回码 1）；本次检查未切换或停止网络"
+    return 1
+  elif $confirmed; then
+    echo "结论: 当前出口已确认（返回码 0）；检测结果只代表本次观测"
+    return 0
+  fi
+  echo "结论: 当前出口未确认（返回码 2）；不能把已选中或在线视为已出网"
+  return 2
+}
+
+cmd_help() { awk 'BEGIN{p=0} /^# =+$/ {p++; if (p==2) exit; next} p==1 {sub(/^# ?/, ""); print}' "$0"; }
+
+# 只供受限 systemd 服务使用；不能在普通宿主机上意外启动代理。
+if [[ ${1:-} == __socks ]]; then
+  [[ $(id -un) == egress && /proc/self/ns/net -ef /run/netns/"$ROUTER" ]] || die "private proxy entry requires router namespace and egress user"
+  run_socks
+fi
+
+case "${1:-}" in version|--version|-V) echo "OneEgress $ONEEGRESS_VERSION"; exit 0 ;; esac
+
+guard_work_context "${1:-}" || exit 2
+# 手动入口内部使用现有免密 sudo 权限；不改变 sudoers。
+if [[ $(id -u) -ne 0 ]]; then
+  case "${1:-}" in
+    check|switch|shell|config|init) exec sudo -n -- /usr/local/sbin/egress "$@" ;;
+    help|-h|--help) cmd_help; exit 0 ;;
+    *) die "run as root (sudo egress ${1:-help})" ;;
+  esac
+fi
+# 先取得全局操作锁，再读配置/修改节点/启停服务。锁随进程退出自动释放。
+# shell/enter 验收后、开启交互会话前显式解锁，不能阻塞其他窗口的全局切换。
+case "${1:-}" in
+  switch|shell|init|enter|up|start|down|mudi|phone|home) control_lock || exit $? ;;
+  config) [[ $# -le 1 ]] || { control_lock || exit $?; } ;;
+esac
+# 只读命令不能刷新状态文件或隐式启动服务。
+case "${1:-}" in
+  up|start)
+    mkdir -p "$DIR"
+    host=$(host_ip)
+    [[ -n ${host:-} ]] && echo "$host" > "$HOST_IP_FILE"
+    ;;
+  mudi|phone|home) mkdir -p "$DIR" ;;
+esac
+
+case "${1:-}" in
+  enter) shift; cmd_enter "$@" ;;
+  shell) shift; cmd_shell "$@" ;;
+  switch) shift; cmd_switch "$@" ;;
+  config) shift; cmd_config "$@" ;;
+  init) shift; cmd_init "$@" ;;
+  up|start) assert_host_route; proxy_up; pick_exit >/dev/null || die "all exits failed; proxy stopped"; echo ready ;;
+  mudi) echo mudi > "$PREFER_FILE"; echo "prefer mudi" ;;
+  phone) echo phone > "$PREFER_FILE"; echo "prefer phone" ;;
+  home) echo home > "$PREFER_FILE"; echo "prefer home (temporary emergency exit)" ;;
+  down) cmd_down ;;
+  status) cmd_status ;;
+  check) cmd_check ;;
+  help|-h|--help) cmd_help ;;
+  *) echo "usage: egress check|switch [node]|shell [user]|config [switch|shell|node ...]|enter|status|down|mudi|phone|home|help"; exit 1 ;;
+esac

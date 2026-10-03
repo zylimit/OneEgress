@@ -1,0 +1,21 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: python3 tests/test_project.py
+      - run: |
+          test "$GITHUB_REF_NAME" = "v$(bash bin/egress --version | awk '{print $2}')"
+          bash scripts/build.sh
+      - name: Publish versioned download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/oneegress-*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "OneEgress $GITHUB_REF_NAME" --notes-file CHANGELOG.md
