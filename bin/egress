@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# OneEgress — 全机共享、断线不回落的工作出口。v0.1.0
+# OneEgress — 全机共享、断线不回落的工作出口。v0.1.1
 # 项目：https://github.com/zylimit/OneEgress
 #
 # egress --version                     查看版本
@@ -11,13 +11,14 @@
 # egress switch [候选]                   全局切换并验收，影响全部工作壳
 # egress shell [用户]                    只选用户，不选出口；exit / Ctrl+D 退出
 # egress check                         实测公网 IPv4、运营商与隔离状态
+# egress reload                        仅重载共享代理并验收，不重启 Tailscale/不切出口
 # sudo egress enter                    兼容入口，等价于 egress shell root
 # sudo egress down                     停止共享服务并关闭全部工作壳，SSH 路由不动
 #
 # 支持范围：Ubuntu 24.04 + systemd，宿主机管理默认网卡 eth0。
 # 系统 tailscaled 必须 inactive / masked；切勿取消 masked 或让它接管整机路由。
 # 所有 Tailscale 管理必须显式使用 /run/tailscale-egress/tailscaled.sock。
-# 共享 work / egress-router 命名空间；SOCKS 公网 TCP 绑定 tailscale-eg。
+# 共享 work / egress-router 命名空间；HTTP/SOCKS 公网 TCP 绑定 tailscale-eg。
 # 代理 UID 的 IPv4/IPv6 内核防火墙拒绝非隧道公网流量，不自动回落宿主机。
 # 断网后壳仍可操作；设备恢复后新请求可恢复，失败请求是否重试取决于应用。
 # 所有配置/切换/启停操作全局互斥；忙时返回 75，请稍后重试。
@@ -37,8 +38,8 @@ if [[ ${EGRESS_WORK_BOOTSTRAP:-} == 1 && $- == *i* && ${BASH_SOURCE[0]} != "$0" 
   unset EGRESS_PROXY_URL
   export ALL_PROXY="socks5h://10.200.0.1:1055"
   export all_proxy="$ALL_PROXY"
-  export HTTPS_PROXY="$ALL_PROXY" https_proxy="$ALL_PROXY"
-  export HTTP_PROXY="$ALL_PROXY" http_proxy="$ALL_PROXY"
+  export HTTPS_PROXY="http://10.200.0.1:1055" https_proxy="http://10.200.0.1:1055"
+  export HTTP_PROXY="$HTTPS_PROXY" http_proxy="$HTTPS_PROXY"
   export NO_PROXY= no_proxy=
   unset HISTFILE
   PS1="[work:${USER}] ${PS1:-\u@\h:\w\$ }"
@@ -52,7 +53,7 @@ SOCK=/run/tailscale-egress/tailscaled.sock
 WORK_RC=/usr/local/sbin/egress
 DIR=/var/lib/tailscale-egress
 CONFIG_FILE=$DIR/config.json
-ONEEGRESS_VERSION=0.1.0
+ONEEGRESS_VERSION=0.1.1
 UNIT=ts-egress
 PROXY_UNIT=egress-socks
 ROUTER=egress-router
@@ -280,12 +281,14 @@ cmd_init() {
   return 2
 }
 
-# 唯一代码文件内置 SOCKS CONNECT 服务。DNS 受 UID 防火墙约束；TCP 再绑定 TUN。
+# 同一端口自动识别 SOCKS5 / HTTP CONNECT / HTTP 转发；共享唯一隧道连接路径。
+# 不解密 TLS；DNS 受 UID 防火墙约束，所有公网 TCP 再绑定 TUN，无直连重试。
 run_socks() {
   exec python3 - "$HOST_ADDR" "$PROXY_PORT" "$TUN" <<'PY'
-import ipaddress, select, socket, socketserver, struct, sys, threading
-HOST, PORT, TUN = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+import ipaddress, re, select, socket, socketserver, struct, sys, threading, time
+from urllib.parse import urlsplit
 LIMIT = threading.BoundedSemaphore(64)
+HEADER_LIMIT = 16384
 def exact(s, size):
     data = b''
     while len(data) < size:
@@ -294,66 +297,159 @@ def exact(s, size):
             raise ConnectionError('incomplete SOCKS request')
         data += chunk
     return data
+
+def tunnel_connect(host, port, family=socket.AF_INET):
+    if not host or not 1 <= port <= 65535:
+        raise ValueError('invalid destination')
+    # Resolver and socket both stay in the guarded proxy namespace/UID.
+    addresses = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+    for af, socktype, proto, _, address in addresses:
+        if not ipaddress.ip_address(address[0]).is_global:
+            continue
+        candidate = socket.socket(af, socktype, proto)
+        try:
+            candidate.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, TUN.encode() + b'\0')
+            candidate.settimeout(7)
+            candidate.connect(address)
+            return candidate
+        except OSError:
+            candidate.close()
+    raise ConnectionError('no tunnel connection')
+
+def http_request(client, first):
+    data = first
+    deadline = time.monotonic() + 12
+    while b'\r\n\r\n' not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or len(data) >= HEADER_LIMIT:
+            raise ValueError('HTTP header limit')
+        client.settimeout(remaining)
+        chunk = client.recv(min(4096, HEADER_LIMIT - len(data)))
+        if not chunk:
+            raise ValueError('incomplete HTTP headers')
+        data += chunk
+    head, pending = data.split(b'\r\n\r\n', 1)
+    lines = head.decode('ascii').split('\r\n')
+    method, target, version = lines[0].split(' ')
+    if not re.fullmatch(r'[A-Z]+', method) or version not in ('HTTP/1.0', 'HTTP/1.1'):
+        raise ValueError('invalid HTTP request line')
+    if any(ord(c) <= 32 or ord(c) == 127 for c in target):
+        raise ValueError('invalid HTTP target')
+    headers = []
+    for line in lines[1:]:
+        name, value = line.split(':', 1)
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            raise ValueError('invalid HTTP header')
+        if any((ord(c) < 32 and c != '\t') or ord(c) == 127 for c in value):
+            raise ValueError('invalid HTTP header value')
+        headers.append((name.lower(), value.strip()))
+    lengths = [v for k, v in headers if k == 'content-length']
+    encodings = [v for k, v in headers if k == 'transfer-encoding']
+    if len(lengths) > 1 or len(encodings) > 1 or (lengths and encodings):
+        raise ValueError('ambiguous HTTP body framing')
+    if lengths and not re.fullmatch(r'[0-9]+', lengths[0]):
+        raise ValueError('invalid Content-Length')
+    if encodings and encodings[0].lower() != 'chunked':
+        raise ValueError('unsupported Transfer-Encoding')
+    hosts = [v for k, v in headers if k == 'host']
+    if len(hosts) > 1 or (version == 'HTTP/1.1' and not hosts):
+        raise ValueError('invalid Host header')
+    parsed = urlsplit('//' + target if method == 'CONNECT' else target)
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ValueError('invalid HTTP destination')
+    host = parsed.hostname
+    port = parsed.port
+    if method == 'CONNECT':
+        if parsed.path or parsed.query or port is None or encodings or (lengths and int(lengths[0]) != 0):
+            raise ValueError('invalid CONNECT authority')
+        forward = b''
+    else:
+        if parsed.scheme != 'http':
+            raise ValueError('absolute HTTP URL required; use CONNECT for TLS')
+        port = 80 if port is None else port
+        authority = ('[' + host + ']' if ':' in host else host) + (':' + str(port) if port != 80 else '')
+        origin = parsed.path or '/'
+        if parsed.query:
+            origin += '?' + parsed.query
+        # Never forward proxy credentials. Disable upstream connection reuse.
+        hop = {'host', 'connection', 'proxy-connection', 'proxy-authorization', 'keep-alive', 'upgrade', 'te', 'trailer'}
+        nominated = {token.strip().lower() for k, v in headers if k == 'connection' for token in v.split(',')}
+        if nominated & {'host', 'content-length', 'transfer-encoding'}:
+            raise ValueError('unsafe Connection header')
+        hop |= nominated
+        output = [f'{method} {origin} {version}', 'Host: ' + authority, 'Connection: close']
+        output += [k + ': ' + v for k, v in headers if k not in hop]
+        forward = ('\r\n'.join(output) + '\r\n\r\n').encode('ascii')
+    if not 1 <= port <= 65535:
+        raise ValueError('invalid destination port')
+    return host, port, socket.AF_INET6 if ':' in host else socket.AF_INET, method, forward, pending
+
+def relay(client, remote):
+    client.settimeout(20)
+    remote.settimeout(20)
+    readers = [client, remote]
+    while readers:
+        ready, _, _ = select.select(readers, [], [], 300)
+        if not ready:
+            break
+        for source in ready:
+            target = remote if source is client else client
+            data = source.recv(65536)
+            if data:
+                target.sendall(data)
+            else:
+                readers.remove(source)
+                target.shutdown(socket.SHUT_WR)
+
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         client, remote = self.request, None
+        protocol, accepted = 'http', False
         client.settimeout(12)
         try:
-            version, count = exact(client, 2)
-            methods = exact(client, count)
-            if version != 5 or 0 not in methods:
-                client.sendall(b'\x05\xff')
-                return
-            client.sendall(b'\x05\x00')
-            version, command, reserved, kind = exact(client, 4)
-            if version != 5 or command != 1 or reserved != 0:
-                raise ValueError('CONNECT only')
-            if kind == 1:
-                host = socket.inet_ntop(socket.AF_INET, exact(client, 4))
-            elif kind == 4:
-                host = socket.inet_ntop(socket.AF_INET6, exact(client, 16))
-            elif kind == 3:
-                host = exact(client, exact(client, 1)[0]).decode('ascii')
+            first = exact(client, 1)
+            if first == b'\x05':
+                protocol = 'socks'
+                count = exact(client, 1)[0]
+                methods = exact(client, count)
+                if 0 not in methods:
+                    client.sendall(b'\x05\xff')
+                    return
+                client.sendall(b'\x05\x00')
+                version, command, reserved, kind = exact(client, 4)
+                if version != 5 or command != 1 or reserved != 0:
+                    raise ValueError('CONNECT only')
+                if kind == 1:
+                    host = socket.inet_ntop(socket.AF_INET, exact(client, 4))
+                elif kind == 4:
+                    host = socket.inet_ntop(socket.AF_INET6, exact(client, 16))
+                elif kind == 3:
+                    host = exact(client, exact(client, 1)[0]).decode('ascii')
+                else:
+                    raise ValueError('address type')
+                port = struct.unpack('!H', exact(client, 2))[0]
+                family = socket.AF_INET6 if kind == 4 else socket.AF_INET
+                remote = tunnel_connect(host, port, family)
+                client.sendall(b'\x05\x00\x00\x01' + b'\x00' * 6)
+                accepted = True
             else:
-                raise ValueError('address type')
-            port = struct.unpack('!H', exact(client, 2))[0]
-            family = socket.AF_INET6 if kind == 4 else socket.AF_INET
-            # 不使用宿主机的 resolver：服务独立 mount/net namespace，DNS 只能走 TUN。
-            addresses = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
-            for af, socktype, proto, _, address in addresses:
-                if not ipaddress.ip_address(address[0]).is_global:
-                    continue
-                candidate = socket.socket(af, socktype, proto)
+                host, port, family, method, forward, pending = http_request(client, first)
+                remote = tunnel_connect(host, port, family)
+                if method == 'CONNECT':
+                    client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                    accepted = True
+                if forward or pending:
+                    remote.sendall(forward + pending)
+            accepted = True
+            relay(client, remote)
+        except (OSError, ValueError, UnicodeError) as error:
+            if not accepted:
                 try:
-                    candidate.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, TUN.encode() + b'\0')
-                    candidate.settimeout(7)
-                    candidate.connect(address)
-                    remote = candidate
-                    break
-                except OSError:
-                    candidate.close()
-            if remote is None:
-                raise ConnectionError('no tunnel connection')
-            client.sendall(b'\x05\x00\x00\x01' + b'\x00' * 6)
-            client.settimeout(20)
-            remote.settimeout(20)
-            readers = [client, remote]
-            while readers:
-                ready, _, _ = select.select(readers, [], [], 300)
-                if not ready:
-                    break
-                for source in ready:
-                    target = remote if source is client else client
-                    data = source.recv(65536)
-                    if data:
-                        target.sendall(data)
+                    if protocol == 'socks':
+                        client.sendall(b'\x05\x04\x00\x01' + b'\x00' * 6)
                     else:
-                        readers.remove(source)
-                        target.shutdown(socket.SHUT_WR)
-        except (OSError, ValueError, UnicodeError):
-            if remote is None:
-                try:
-                    client.sendall(b'\x05\x04\x00\x01' + b'\x00' * 6)
+                        status = b'400 Bad Request' if isinstance(error, ValueError) else b'502 Bad Gateway'
+                        client.sendall(b'HTTP/1.1 ' + status + b'\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
                 except OSError:
                     pass
         finally:
@@ -376,8 +472,10 @@ class Server(socketserver.ThreadingTCPServer):
             super().process_request_thread(request, address)
         finally:
             LIMIT.release()
-with Server((HOST, PORT), Handler) as server:
-    server.serve_forever()
+if __name__ == '__main__':
+    HOST, PORT, TUN = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    with Server((HOST, PORT), Handler) as server:
+        server.serve_forever()
 PY
 }
 
@@ -476,8 +574,8 @@ run_work_shell() (
     ip netns exec "$NS" sudo -n -H -u "$shell_user" -- env \
       EGRESS_WORK_SHELL=1 EGRESS_WORK_BOOTSTRAP=1 \
       ALL_PROXY="socks5h://$PROXY" all_proxy="socks5h://$PROXY" \
-      HTTPS_PROXY="socks5h://$PROXY" https_proxy="socks5h://$PROXY" \
-      HTTP_PROXY="socks5h://$PROXY" http_proxy="socks5h://$PROXY" \
+      HTTPS_PROXY="http://$PROXY" https_proxy="http://$PROXY" \
+      HTTP_PROXY="http://$PROXY" http_proxy="http://$PROXY" \
       NO_PROXY= no_proxy= HISTFILE=/dev/null \
       bash --noprofile --rcfile "$WORK_RC" -i <&0 &
   worker_pid=$!
@@ -491,7 +589,7 @@ run_work_shell() (
 guard_work_context() {
   [[ ${EGRESS_WORK_SHELL:-} == 1 ]] || return 0
   case "${1:-}" in
-    check|switch|shell|config|init|enter|up|start|down|status|mudi|phone|home)
+    check|switch|shell|config|init|reload|enter|up|start|down|status|mudi|phone|home)
       echo "当前已在工作壳中；请用 exit 返回原管理窗口，再运行 egress ${1:-help}。" >&2
       return 2 ;;
   esac
@@ -639,6 +737,30 @@ cmd_switch() {
   fi
 }
 
+cmd_reload() {
+  [[ $# -eq 0 ]] || { echo "用法: egress reload（只重载共享代理，不接受出口参数）" >&2; return 2; }
+  assert_host_route
+  svc is-active "$UNIT" && [[ -S $SOCK ]] && svc is-active "$PROXY_UNIT" || {
+    echo "共享服务未运行；未重载，请先手动 egress switch <设备>。" >&2
+    return 2
+  }
+  hard_guard_ok || { echo "硬隔离规则不完整，拒绝重载。" >&2; return 1; }
+  # ExecStart 仍读取唯一安装文件；只断开当前代理连接，保留 Tailscale/节点/所有壳。
+  systemctl restart "$PROXY_UNIT" || return 2
+  local i
+  for i in {1..15}; do
+    if proxy_listening; then
+      hard_guard_ok || return 1
+      echo "共享 HTTP/SOCKS 代理已重载；未切换出口、未重启 Tailscale，开始验收。"
+      cmd_check
+      return $?
+    fi
+    sleep 0.2
+  done
+  echo "重载后代理未就绪；保持无法联网，不自动回落。" >&2
+  return 2
+}
+
 cmd_down() {
   systemctl stop "$PROXY_UNIT" "$UNIT" >/dev/null 2>&1 || true
   pkill -f 'tailscaled --tun=userspace-networking --statedir=/var/lib/tailscale-egress' >/dev/null 2>&1 || true
@@ -692,7 +814,7 @@ valid_ipv4() {
 cmd_check() {
   local status peer backend node node_ip online option selected=false after before_state after_state selected_count
   local config
-  local host info public_ip country org secondary info_rc secondary_rc
+  local host info public_ip country org secondary info_rc secondary_rc http_ip http_rc
   local unit en ac dev route4 route6 direct_rc=0 unsafe=false confirmed=true
   local ns_exists=false
   local -a reasons=()
@@ -711,7 +833,7 @@ cmd_check() {
   en=$(systemctl is-enabled tailscaled 2>/dev/null || true)
   ac=$(systemctl is-active tailscaled 2>/dev/null || true)
   dev=$(default_dev)
-  echo "隔离 Tailscale: ${unit:-unknown}；SOCKS: $(systemctl is-active "$PROXY_UNIT" 2>/dev/null || true)；系统 tailscaled: ${en:-unknown} / ${ac:-unknown}"
+  echo "隔离 Tailscale: ${unit:-unknown}；共享 HTTP/SOCKS: $(systemctl is-active "$PROXY_UNIT" 2>/dev/null || true)；系统 tailscaled: ${en:-unknown} / ${ac:-unknown}"
   echo "宿主机默认网卡: ${dev:-无}"
   if [[ $dev != eth0 || $en != masked || $ac != inactive ]]; then
     unsafe=true
@@ -857,6 +979,24 @@ cmd_check() {
       fi
       echo "工作壳实测 IPv4 (ifconfig.me): 未确认"
     fi
+    if http_ip=$(ip netns exec "$NS" curl -4 -fsS --connect-timeout 5 --max-time 10 \
+      --noproxy '' --proxy "http://$PROXY" https://ifconfig.me 2>&1); then
+      http_rc=0
+    else
+      http_rc=$?
+      printf 'HTTP/CONNECT 探测失败: curl=%s\n错误信息: %s\n' "$http_rc" "$http_ip"
+      http_ip=
+    fi
+    if valid_ipv4 "$http_ip"; then
+      echo "HTTP/CONNECT 实测 IPv4 (ifconfig.me): $http_ip"
+      if [[ $http_ip == "$host" ]]; then
+        unsafe=true
+        reasons+=("HTTP/CONNECT 实测出口为宿主机")
+      fi
+    else
+      confirmed=false
+      reasons+=("HTTP/CONNECT 未确认公网出口，curl=$http_rc")
+    fi
     if ! $selected && { valid_ipv4 "$public_ip" || valid_ipv4 "$secondary"; }; then
       unsafe=true
       reasons+=("未确认出口节点，但 SOCKS 仍可出网")
@@ -906,7 +1046,7 @@ guard_work_context "${1:-}" || exit 2
 # 手动入口内部使用现有免密 sudo 权限；不改变 sudoers。
 if [[ $(id -u) -ne 0 ]]; then
   case "${1:-}" in
-    check|switch|shell|config|init) exec sudo -n -- /usr/local/sbin/egress "$@" ;;
+    check|switch|shell|config|init|reload) exec sudo -n -- /usr/local/sbin/egress "$@" ;;
     help|-h|--help) cmd_help; exit 0 ;;
     *) die "run as root (sudo egress ${1:-help})" ;;
   esac
@@ -914,7 +1054,7 @@ fi
 # 先取得全局操作锁，再读配置/修改节点/启停服务。锁随进程退出自动释放。
 # shell/enter 验收后、开启交互会话前显式解锁，不能阻塞其他窗口的全局切换。
 case "${1:-}" in
-  switch|shell|init|enter|up|start|down|mudi|phone|home) control_lock || exit $? ;;
+  switch|shell|init|reload|enter|up|start|down|mudi|phone|home) control_lock || exit $? ;;
   config) [[ $# -le 1 ]] || { control_lock || exit $?; } ;;
 esac
 # 只读命令不能刷新状态文件或隐式启动服务。
@@ -930,6 +1070,7 @@ esac
 case "${1:-}" in
   enter) shift; cmd_enter "$@" ;;
   shell) shift; cmd_shell "$@" ;;
+  reload) shift; cmd_reload "$@" ;;
   switch) shift; cmd_switch "$@" ;;
   config) shift; cmd_config "$@" ;;
   init) shift; cmd_init "$@" ;;

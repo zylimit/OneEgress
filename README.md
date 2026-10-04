@@ -4,6 +4,8 @@
 
 所有工作壳（包括不同 Linux 用户）共用一个出口节点。`switch` 全局生效，`shell` 只选用户。出口不可用时联网请求失败；SSH 管理网络保留原路线。唯一出口节点不等于固定公网 IP，运营商 NAT 可能为不同目标分配不同地址。
 
+v0.1.1 起，同一内部端口 `10.200.0.1:1055` 同时支持 HTTP/CONNECT 和 SOCKS5。工作壳自动将 `HTTP_PROXY` / `HTTPS_PROXY`（含小写）设为 `http://10.200.0.1:1055`，`ALL_PROXY` 保留 SOCKS。[Claude Code 不支持 SOCKS](https://code.claude.com/docs/en/network-config)，因此使用 HTTP/CONNECT；不解密 HTTPS，不安装额外证书，两种协议都复用同一受隔离保护的隧道连接函数。代理仅面向受信任的本机工作壳，不是公开代理。
+
 ## 首版支持范围
 
 Ubuntu 24.04、systemd、管理默认网卡 `eth0`、`/dev/net/tun`，管理员已确认宿主机 IPv4 转发策略（`net.ipv4.ip_forward=1`）。不是整机 VPN，也不会把普通 SSH 窗口自动改成工作出口。root / sudo 主动绕过隔离不在保证范围内；程序已经失败的请求是否自动重试由程序决定。
@@ -17,17 +19,27 @@ Ubuntu 24.04、systemd、管理默认网卡 `eth0`、`/dev/net/tun`，管理员�
 从 [Releases](https://github.com/zylimit/OneEgress/releases) 下载指定版本和校验文件。推荐固定版本，不执行 `curl | sudo bash`。
 
 ```bash
-curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.0/oneegress-v0.1.0.tar.gz
-curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.0/SHA256SUMS
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.1/oneegress-v0.1.1.tar.gz
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.1/SHA256SUMS
 sha256sum -c SHA256SUMS
-tar -xzf oneegress-v0.1.0.tar.gz
-cd oneegress-0.1.0
+tar -xzf oneegress-v0.1.1.tar.gz
+cd oneegress-0.1.1
 sudo ./install.sh --check
 sudo ./install.sh
 egress --version
 ```
 
 现有机器升级使用相同命令。安装/升级保留 `/var/lib/tailscale-egress/config.json` 和 Tailscale 登录状态，不自动切换出口、不重启共享服务。新功能涉及代理服务时，需在维护窗口手动切换/重建后验收，不能把“更新文件”当作运行中进程已经更新。
+
+从 v0.1.0 升至 v0.1.1，安装后在普通 SSH 管理窗口执行 `egress reload`，只重启共享应用代理并验收，保留 Tailscale、当前节点、工作壳与防火墙；已有代理连接会中断。此命令要求现有服务与硬隔离已经就绪，不负责重新配置网络。已开的工作壳环境不会随文件更新：在旧工作壳 `exit`，然后 `egress shell` 再执行 `claude`。也可以在旧工作壳只刷新代理环境而不退出：
+
+```bash
+export HTTPS_PROXY=http://10.200.0.1:1055 https_proxy=http://10.200.0.1:1055
+export HTTP_PROXY="$HTTPS_PROXY" http_proxy="$HTTPS_PROXY"
+claude
+```
+
+不要仅修改代理 URL 而不更新/重载服务；v0.1.0 的服务不会处理 HTTP。不要为了兼容而取消代理或退出工作隔离后运行应用。
 
 ## 新机器首次配置
 
@@ -53,6 +65,7 @@ egress switch iphone
 
 ```bash
 egress check                  # 只读：当前节点、公网 IP、运营商、隔离
+egress reload                 # 升级后仅重载共享代理；已有网络连接会中断
 egress switch ipad            # 全局切换；所有工作壳的后续连接使用此出口
 egress shell                  # 默认用户，当前共享出口
 egress shell ubuntu           # 只改变登录用户，不创建私有出口

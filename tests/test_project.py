@@ -9,12 +9,16 @@ from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / 'bin/egress'
 SOURCE = APP.read_text()
 FUNCTIONS = SOURCE.split('# 只供受限 systemd 服务使用', 1)[0]
+VERSION = '0.1.1'
+PROXY_SOURCE = SOURCE.split("<<'PY'\n",1)[1].split('\nPY\n',1)[0]
 
 def run(args, **kwargs):
     return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -32,7 +36,7 @@ class ApplicationTests(unittest.TestCase):
     def test_version_without_privileges(self):
         r=run(['bash',str(APP),'--version'])
         self.assertEqual(r.returncode,0,r.stderr)
-        self.assertRegex(r.stdout, r'^OneEgress 0\.1\.0\n$')
+        self.assertEqual(r.stdout, f'OneEgress {VERSION}\n')
 
     def test_embedded_proxy_syntax(self):
         python=SOURCE.split("<<'PY'\n",1)[1].split('\nPY\n',1)[0]
@@ -95,8 +99,48 @@ class ApplicationTests(unittest.TestCase):
         self.assertNotIn('UNEXPECTED',r.stdout)
 
     def test_work_shell_guard(self):
-        r=bash('EGRESS_WORK_SHELL=1; guard_work_context switch')
+        for command in ('switch', 'reload'):
+            r=bash('EGRESS_WORK_SHELL=1; guard_work_context "$1"', command)
+            self.assertEqual(r.returncode,2)
+
+    def test_reload_only_restarts_shared_proxy(self):
+        with tempfile.TemporaryDirectory(prefix='oneegress-reload-') as temp:
+            sock=Path(temp)/'local.sock'
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(sock))
+                r=bash('SOCK="$1"; assert_host_route() { :; }; svc() { return 0; }; '
+                       'hard_guard_ok() { return 0; }; proxy_listening() { return 0; }; '
+                       'systemctl() { echo "CALL:$*"; }; cmd_check() { echo CHECKED; return 0; }; '
+                       'proxy_up() { echo UNEXPECTED; }; ts() { echo UNEXPECTED; }; cmd_reload',sock)
+                self.assertEqual(r.returncode,0,r.stderr)
+                self.assertIn('CALL:restart egress-socks',r.stdout)
+                self.assertIn('CHECKED',r.stdout)
+                self.assertNotIn('UNEXPECTED',r.stdout)
+                self.assertNotIn('restart ts-egress',r.stdout)
+                r=bash('SOCK="$1"; assert_host_route() { :; }; svc() { return 0; }; '
+                       'hard_guard_ok() { return 1; }; systemctl() { echo UNEXPECTED; }; cmd_reload',sock)
+                self.assertEqual(r.returncode,1,r.stderr)
+                self.assertNotIn('UNEXPECTED',r.stdout)
+
+    def test_reload_requires_existing_service_and_no_exit_argument(self):
+        r=bash('assert_host_route() { :; }; svc() { return 1; }; systemctl() { echo UNEXPECTED; }; cmd_reload')
         self.assertEqual(r.returncode,2)
+        self.assertNotIn('UNEXPECTED',r.stdout)
+        r=bash('assert_host_route() { echo UNEXPECTED; }; cmd_reload ipad')
+        self.assertEqual(r.returncode,2)
+        self.assertNotIn('UNEXPECTED',r.stdout)
+
+    def test_http_environment_is_global(self):
+        # Both launch paths must use HTTP for HTTP(S), while ALL_PROXY keeps SOCKS compatibility.
+        self.assertIn('export HTTPS_PROXY="http://10.200.0.1:1055"', SOURCE)
+        self.assertIn('HTTPS_PROXY="http://$PROXY" https_proxy="http://$PROXY"', SOURCE)
+        self.assertNotIn('HTTPS_PROXY="socks5h:', SOURCE)
+        self.assertIn('ALL_PROXY="socks5h://$PROXY"', SOURCE)
+
+    def test_check_verifies_both_protocols(self):
+        self.assertIn('--proxy "http://$PROXY" https://ifconfig.me', SOURCE)
+        self.assertIn('--socks5-hostname "$PROXY" https://ifconfig.me', SOURCE)
+        self.assertIn('HTTP/CONNECT 未确认公网出口', SOURCE)
 
     def test_init_preserves_existing_service(self):
         with tempfile.TemporaryDirectory(prefix='oneegress-init-') as temp:
@@ -166,16 +210,153 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='oneegress-package-') as temp:
             r=run(['bash',str(ROOT/'scripts/build.sh'),temp])
             self.assertEqual(r.returncode,0,r.stderr)
-            archive=Path(temp)/'oneegress-v0.1.0.tar.gz'
+            archive=Path(temp)/f'oneegress-v{VERSION}.tar.gz'
             before=hashlib.sha256(archive.read_bytes()).hexdigest()
             self.assertIn(before,(Path(temp)/'SHA256SUMS').read_text())
             with tarfile.open(archive) as package:
                 files={m.name for m in package.getmembers() if m.isfile()}
-                self.assertEqual(files,{'oneegress-0.1.0/'+f for f in (
+                self.assertEqual(files,{f'oneegress-{VERSION}/'+f for f in (
                     'bin/egress','install.sh','config.example.json','README.md','CHANGELOG.md')})
             r=run(['bash',str(ROOT/'scripts/build.sh'),temp])
             self.assertEqual(r.returncode,0,r.stderr)
             self.assertEqual(hashlib.sha256(archive.read_bytes()).hexdigest(),before)
+
+class ProxyTests(unittest.TestCase):
+    def setUp(self):
+        self.proxy = {'__name__': 'oneegress_proxy_test', 'TUN': 'test-tun'}
+        exec(compile(PROXY_SOURCE, 'embedded_proxy', 'exec'), self.proxy)
+
+    def conversation(self, payload, connect, followup=b''):
+        client, service = socket.socketpair()
+        client.settimeout(3)
+        self.proxy['tunnel_connect'] = connect
+        worker = threading.Thread(target=self.proxy['Handler'], args=(service, ('test', 0), None), daemon=True)
+        worker.start()
+        try:
+            client.sendall(payload)
+            first = client.recv(65536)
+            if followup:
+                client.sendall(followup)
+                first += client.recv(65536)
+            return first
+        finally:
+            client.close()
+            worker.join(3)
+            service.close()
+            self.assertFalse(worker.is_alive(), 'proxy worker did not exit')
+
+    def failed_connect(self, *args):
+        raise ConnectionError('simulated exit offline')
+
+    def test_http_connect_failure_returns_502_not_success(self):
+        response=self.conversation(b'CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n', self.failed_connect)
+        self.assertTrue(response.startswith(b'HTTP/1.1 502'), response)
+        self.assertNotIn(b'200', response)
+
+    def test_http_forward_failure_returns_502(self):
+        response=self.conversation(b'GET http://example.com/test HTTP/1.1\r\nHost: example.com\r\n\r\n', self.failed_connect)
+        self.assertTrue(response.startswith(b'HTTP/1.1 502'), response)
+
+    def test_invalid_http_never_attempts_connect(self):
+        for request in (
+            b'GET /relative HTTP/1.1\r\nHost: example.com\r\n\r\n',
+            b'CONNECT example.com HTTP/1.1\r\nHost: example.com\r\n\r\n',
+            b'CONNECT localhost:0 HTTP/1.1\r\nHost: localhost\r\n\r\n',
+            b'GET http://user:password@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n',
+            b'GET http://example.com/ HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n',
+            b'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n',
+            b'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: Content-Length\r\n\r\n',
+            b'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n folded: header\r\n\r\n',
+            b'GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nX-Long: '+b'a'*17000+b'\r\n\r\n',
+        ):
+            with self.subTest(request=request[:100]):
+                connector=mock.Mock(side_effect=AssertionError('unexpected outbound connection'))
+                response=self.conversation(request, connector)
+                self.assertTrue(response.startswith(b'HTTP/1.1 400'), response)
+                connector.assert_not_called()
+
+    def test_http_forward_rewrites_target_and_strips_proxy_credentials(self):
+        class Client:
+            def settimeout(self, timeout): pass
+            def recv(self, size):
+                data=self.data[:size]
+                self.data=self.data[size:]
+                return data
+        client=Client()
+        client.data=b'OST http://example.com:8080/path?q=1 HTTP/1.1\r\nHost: ignored\r\nProxy-Authorization: secret\r\nProxy-Connection: keep-alive\r\nContent-Length: 4\r\n\r\nbody'
+        host, port, family, method, forward, pending=self.proxy['http_request'](client,b'P')
+        self.assertEqual((host,port,method),('example.com',8080,'POST'))
+        self.assertTrue(forward.startswith(b'POST /path?q=1 HTTP/1.1\r\n'))
+        self.assertIn(b'Host: example.com:8080\r\n',forward)
+        self.assertIn(b'Connection: close\r\n',forward)
+        self.assertNotIn(b'secret',forward)
+        self.assertNotIn(b'ignored',forward)
+        self.assertEqual(pending,b'body')
+
+    def test_connect_relays_without_tls_interception(self):
+        outbound, upstream=socket.socketpair()
+        upstream.settimeout(3)
+        seen=[]
+        def echo():
+            try:
+                seen.append(upstream.recv(65536))
+                upstream.sendall(b'opaque-server-data')
+            finally:
+                upstream.close()
+        worker=threading.Thread(target=echo, daemon=True)
+        worker.start()
+        connector=mock.Mock(return_value=outbound)
+        response=self.conversation(b'CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n\r\n', connector, b'opaque-client-data')
+        worker.join(3)
+        self.assertEqual(response,b'HTTP/1.1 200 Connection Established\r\n\r\nopaque-server-data')
+        self.assertEqual(seen,[b'opaque-client-data'])
+        connector.assert_called_once_with('api.anthropic.com',443,socket.AF_INET)
+
+    def test_socks_protocol_still_works_and_fails_closed(self):
+        client, service=socket.socketpair()
+        client.settimeout(3)
+        self.proxy['tunnel_connect']=self.failed_connect
+        worker=threading.Thread(target=self.proxy['Handler'],args=(service,('test',0),None),daemon=True)
+        worker.start()
+        try:
+            client.sendall(b'\x05\x01\x00')
+            self.assertEqual(client.recv(2),b'\x05\x00')
+            client.sendall(b'\x05\x01\x00\x03\x0bexample.com\x01\xbb')
+            self.assertEqual(client.recv(10),b'\x05\x04\x00\x01'+b'\x00'*6)
+        finally:
+            client.close()
+            worker.join(3)
+            service.close()
+            self.assertFalse(worker.is_alive())
+
+    def test_public_destinations_only(self):
+        for address, af in (('127.0.0.1',socket.AF_INET),('10.200.0.1',socket.AF_INET),('169.254.169.254',socket.AF_INET),('::1',socket.AF_INET6),('fd00::1',socket.AF_INET6)):
+            with self.subTest(address=address), mock.patch.object(socket,'getaddrinfo',return_value=[(af,socket.SOCK_STREAM,6,'',(address,443))]), mock.patch.object(socket,'socket') as factory:
+                with self.assertRaises(ConnectionError):
+                    self.proxy['tunnel_connect'](address,443,af)
+                factory.assert_not_called()
+
+    def test_missing_tunnel_never_retries_unbound(self):
+        candidate=mock.Mock()
+        candidate.setsockopt.side_effect=OSError('tunnel unavailable')
+        with mock.patch.object(socket,'getaddrinfo',return_value=[(socket.AF_INET,socket.SOCK_STREAM,6,'',('1.1.1.1',443))]), mock.patch.object(socket,'socket',return_value=candidate) as factory:
+            with self.assertRaises(ConnectionError):
+                self.proxy['tunnel_connect']('one.one.one.one',443)
+            factory.assert_called_once()
+            candidate.setsockopt.assert_called_once_with(socket.SOL_SOCKET,socket.SO_BINDTODEVICE,b'test-tun\0')
+            candidate.connect.assert_not_called()
+            candidate.close.assert_called_once()
+
+    def test_failed_tunnel_connect_closes_socket_without_fallback(self):
+        candidate=mock.Mock()
+        candidate.connect.side_effect=OSError('exit offline')
+        with mock.patch.object(socket,'getaddrinfo',return_value=[(socket.AF_INET,socket.SOCK_STREAM,6,'',('1.1.1.1',443))]), mock.patch.object(socket,'socket',return_value=candidate) as factory:
+            with self.assertRaises(ConnectionError):
+                self.proxy['tunnel_connect']('one.one.one.one',443)
+            factory.assert_called_once()
+            candidate.setsockopt.assert_called_once()
+            candidate.connect.assert_called_once()
+            candidate.close.assert_called_once()
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

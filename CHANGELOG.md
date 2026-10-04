@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1
+
+- 同端口支持 HTTP/CONNECT 与原有 SOCKS5；修复 Claude Code 的 `UnsupportedProxyProtocol`。
+- 工作壳 HTTP(S) 代理环境使用 HTTP，ALL_PROXY 保留 SOCKS；旧壳需刷新环境或重新进入。
+- 两种协议共用同一公网地址过滤与 TUN 绑定连接函数；不增加公网直连、TLS 解密或额外服务。
+- `egress check` 同时实测 SOCKS 和 HTTP/CONNECT；HTTP 失败不能判为已确认。
+- `egress reload` 受全局锁与硬隔离校验保护，仅重载共享代理，不切出口、不重启 Tailscale。
+- 增加协议转发、非法请求、私网目标与隧道失败不回落的离线测试。
+- 本机 HTTP/SOCKS 出口与 Claude 启动连通性实测通过；已做隧道临时阻断/恢复测试，不替代物理设备断网验收或账号登录验收。
+
 ## v0.1.0
 
 - 全机工作壳共享唯一出口，切换影响全部工作壳，不提供按用户/窗口选出口。
