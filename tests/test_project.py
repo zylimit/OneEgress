@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / 'bin/egress'
 SOURCE = APP.read_text()
 FUNCTIONS = SOURCE.split('# 只供受限 systemd 服务使用', 1)[0]
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 PROXY_SOURCE = SOURCE.split("<<'PY'\n",1)[1].split('\nPY\n',1)[0]
 
 def run(args, **kwargs):
@@ -141,6 +141,131 @@ class ApplicationTests(unittest.TestCase):
         self.assertIn('--proxy "http://$PROXY" https://ifconfig.me', SOURCE)
         self.assertIn('--socks5-hostname "$PROXY" https://ifconfig.me', SOURCE)
         self.assertIn('HTTP/CONNECT 未确认公网出口', SOURCE)
+
+    def mocked_probe(self, responses):
+        with tempfile.TemporaryDirectory(prefix='oneegress-probe-') as temp:
+            log=Path(temp)/'calls'
+            outcomes=json.dumps(responses)
+            body='''
+probe_log=$1
+outcomes=$2
+ip() {
+  printf '%s\\n' "$*" >> "$probe_log"
+  local index count rc
+  count=$(wc -l < "$probe_log")
+  index=$((count - 1))
+  rc=$(jq -r --argjson i "$index" '.[$i][0] // 99' <<< "$outcomes")
+  jq -r --argjson i "$index" '.[$i][1] // "unexpected extra attempt"' <<< "$outcomes"
+  return "$rc"
+}
+probe_public test-probe --proxy http://10.200.0.1:1055 https://ifconfig.me
+'''
+            result=bash(body,log,outcomes)
+            calls=log.read_text().splitlines()
+            return result,calls
+
+    def test_probe_success_uses_15_20_limits_once(self):
+        r,calls=self.mocked_probe([[0,'203.0.113.42']])
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(r.stdout,'203.0.113.42\n')
+        self.assertEqual(len(calls),1)
+        self.assertIn('netns exec work curl -q -4 -fsS --connect-timeout 15 --max-time 20',calls[0])
+        self.assertIn('--proxy http://10.200.0.1:1055 https://ifconfig.me',calls[0])
+        self.assertEqual(r.stderr,'')
+
+    def test_probe_timeout_retries_once_and_discards_partial_response(self):
+        r,calls=self.mocked_probe([[28,'partial response\ncurl timeout'],[0,'203.0.113.42']])
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(r.stdout,'203.0.113.42\n')
+        self.assertEqual(len(calls),2)
+        self.assertEqual(calls[0],calls[1])
+        self.assertIn('2/2',r.stderr)
+        self.assertNotIn('partial',r.stdout)
+
+    def test_probe_two_timeouts_fail_without_third_attempt(self):
+        r,calls=self.mocked_probe([[28,'first timeout'],[28,'second timeout'],[0,'unreachable success']])
+        self.assertEqual(r.returncode,28,r.stderr)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(r.stdout,'second timeout\n')
+        self.assertEqual(r.stderr.count('2/2'),1)
+
+    def test_probe_non_timeout_errors_never_retry(self):
+        for rc in (5,6,7,22,35,56,60,97):
+            with self.subTest(rc=rc):
+                r,calls=self.mocked_probe([[rc,'first failure'],[0,'unreachable success']])
+                self.assertEqual(r.returncode,rc,r.stderr)
+                self.assertEqual(len(calls),1)
+                self.assertEqual(r.stdout,'first failure\n')
+                self.assertEqual(r.stderr,'')
+
+    def test_probe_retry_then_other_failure_preserves_final_error(self):
+        r,calls=self.mocked_probe([[28,'timeout'],[60,'certificate failure'],[0,'unreachable success']])
+        self.assertEqual(r.returncode,60,r.stderr)
+        self.assertEqual(len(calls),2)
+        self.assertEqual(r.stdout,'certificate failure\n')
+
+    def test_probe_invalid_success_is_not_retried(self):
+        r,calls=self.mocked_probe([[0,'invalid public response'],[0,'unreachable success']])
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(r.stdout,'invalid public response\n')
+
+    def mocked_check(self, override=''):
+        body='''
+SOCK=$1
+load_configuration() { echo '{"default_node":"test","default_user":"ubuntu"}'; }
+default_dev() { echo eth0; }
+host_ip() { echo 198.51.100.10; }
+systemctl() {
+  if [[ $1 == is-enabled ]]; then echo masked
+  elif [[ $2 == tailscaled ]]; then echo inactive
+  else echo active; fi
+}
+ts() { echo '{"BackendState":"Running","ExitNodeStatus":{"ID":"test"},"Peer":{"test":{"ID":"test","HostName":"test","Online":true,"ExitNode":true,"ExitNodeOption":true,"TailscaleIPs":["100.64.0.42"]}}}'; }
+ip() {
+  if [[ $* == 'netns list' ]]; then echo work
+  elif [[ $* == *'route get'* ]]; then return 1
+  elif [[ $* == *'curl'* ]]; then return 7
+  fi
+}
+iptables() { return 0; }
+hard_guard_ok() { return 0; }
+proxy_listening() { return 0; }
+probe_public() {
+  if [[ $1 == 'ipinfo.io / SOCKS' ]]; then echo '{"ip":"203.0.113.42","country":"TEST","org":"AS64500 Test Provider"}'
+  else echo 203.0.113.42; fi
+}
+'''+override+'\ncmd_check'
+        with tempfile.TemporaryDirectory(prefix='oneegress-check-') as temp:
+            sock=Path(temp)/'local.sock'
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(sock))
+                return bash(body,sock)
+
+    def test_check_admission_gates_preserved(self):
+        r=self.mocked_check()
+        self.assertEqual(r.returncode,0,r.stderr)
+        for override in (
+            'iptables() { return 1; }',
+            'hard_guard_ok() { return 1; }',
+            'host_ip() { echo 203.0.113.42; }',
+            'default_dev() { echo wrong_interface; }',
+        ):
+            with self.subTest(override=override):
+                r=self.mocked_check(override)
+                self.assertEqual(r.returncode,1,r.stdout+r.stderr)
+                self.assertNotIn('当前出口已确认',r.stdout)
+
+    def test_check_invalid_or_failed_probe_cannot_confirm_exit(self):
+        for override in (
+            'probe_public() { echo invalid; return 0; }',
+            'probe_public() { echo timeout; return 28; }',
+            'probe_public() { echo proxy_error; return 97; }',
+        ):
+            with self.subTest(override=override):
+                r=self.mocked_check(override)
+                self.assertEqual(r.returncode,2,r.stdout+r.stderr)
+                self.assertNotIn('当前出口已确认',r.stdout)
 
     def test_init_preserves_existing_service(self):
         with tempfile.TemporaryDirectory(prefix='oneegress-init-') as temp:

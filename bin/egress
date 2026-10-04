@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# OneEgress — 全机共享、断线不回落的工作出口。v0.1.1
+# OneEgress — 全机共享、断线不回落的工作出口。v0.1.2
 # 项目：https://github.com/zylimit/OneEgress
 #
 # egress --version                     查看版本
@@ -53,7 +53,7 @@ SOCK=/run/tailscale-egress/tailscaled.sock
 WORK_RC=/usr/local/sbin/egress
 DIR=/var/lib/tailscale-egress
 CONFIG_FILE=$DIR/config.json
-ONEEGRESS_VERSION=0.1.1
+ONEEGRESS_VERSION=0.1.2
 UNIT=ts-egress
 PROXY_UNIT=egress-socks
 ROUTER=egress-router
@@ -811,6 +811,28 @@ valid_ipv4() {
   done
 }
 
+# 只重试同一探测请求的 curl 超时，不切节点、不启动服务，不走宿主机直连。
+# stdout 仅保留最后一次结果，避免超时的半截响应混入有效 JSON/IP。
+probe_public() {
+  local label=$1 output rc attempt
+  shift
+  for attempt in 1 2; do
+    if output=$(ip netns exec "$NS" curl -q -4 -fsS --connect-timeout 15 --max-time 20 \
+      --noproxy '' "$@" 2>&1); then
+      printf '%s\n' "$output"
+      return 0
+    else
+      rc=$?
+    fi
+    if [[ $rc == 28 && $attempt == 1 ]]; then
+      printf '公网探测超时 (%s): curl=28；在当前出口重试一次（2/2），不切换、不回落。\n' "$label" >&2
+    else
+      printf '%s\n' "$output"
+      return "$rc"
+    fi
+  done
+}
+
 cmd_check() {
   local status peer backend node node_ip online option selected=false after before_state after_state selected_count
   local config
@@ -823,6 +845,7 @@ cmd_check() {
   echo "检查时间: $(date -Is)"
   echo "检查范围: 宿主机和隔离工作壳 $NS（不是调用者浏览器的出口）"
   echo "出口策略: 所有工作壳共用一个全局出口节点，不按用户或窗口分配"
+  echo "公网探测期限: 握手 15 秒；单次总计 20 秒；仅超时重试一次，不切换出口"
   if config=$(load_configuration 2>/dev/null); then
     echo "配置默认值: switch=$(jq -r '.default_node' <<< "$config")；shell=$(jq -r '.default_user' <<< "$config")（不代表当前出口）"
   else
@@ -926,8 +949,7 @@ cmd_check() {
     reasons+=("代理硬隔离未就绪；SOCKS 未运行")
   fi
   if $ns_exists && [[ $unit == active && -S $SOCK ]] && proxy_listening && hard_guard_ok; then
-    if info=$(ip netns exec "$NS" curl -4 -fsS --connect-timeout 5 --max-time 12 \
-      --noproxy '' --socks5-hostname "$PROXY" https://ipinfo.io/json 2>&1); then
+    if info=$(probe_public 'ipinfo.io / SOCKS' --socks5-hostname "$PROXY" https://ipinfo.io/json); then
       info_rc=0
     else
       info_rc=$?
@@ -953,8 +975,7 @@ cmd_check() {
       fi
       echo "工作壳实测 IPv4 (ipinfo.io): 未确认"
     fi
-    if secondary=$(ip netns exec "$NS" curl -4 -fsS --connect-timeout 5 --max-time 10 \
-      --noproxy '' --socks5-hostname "$PROXY" https://ifconfig.me 2>&1); then
+    if secondary=$(probe_public 'ifconfig.me / SOCKS' --socks5-hostname "$PROXY" https://ifconfig.me); then
       secondary_rc=0
     else
       secondary_rc=$?
@@ -979,8 +1000,7 @@ cmd_check() {
       fi
       echo "工作壳实测 IPv4 (ifconfig.me): 未确认"
     fi
-    if http_ip=$(ip netns exec "$NS" curl -4 -fsS --connect-timeout 5 --max-time 10 \
-      --noproxy '' --proxy "http://$PROXY" https://ifconfig.me 2>&1); then
+    if http_ip=$(probe_public 'ifconfig.me / HTTP CONNECT' --proxy "http://$PROXY" https://ifconfig.me); then
       http_rc=0
     else
       http_rc=$?

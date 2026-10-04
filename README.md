@@ -19,17 +19,19 @@ Ubuntu 24.04、systemd、管理默认网卡 `eth0`、`/dev/net/tun`，管理员�
 从 [Releases](https://github.com/zylimit/OneEgress/releases) 下载指定版本和校验文件。推荐固定版本，不执行 `curl | sudo bash`。
 
 ```bash
-curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.1/oneegress-v0.1.1.tar.gz
-curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.1/SHA256SUMS
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.2/oneegress-v0.1.2.tar.gz
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.2/SHA256SUMS
 sha256sum -c SHA256SUMS
-tar -xzf oneegress-v0.1.1.tar.gz
-cd oneegress-0.1.1
+tar -xzf oneegress-v0.1.2.tar.gz
+cd oneegress-0.1.2
 sudo ./install.sh --check
 sudo ./install.sh
 egress --version
 ```
 
 现有机器升级使用相同命令。安装/升级保留 `/var/lib/tailscale-egress/config.json` 和 Tailscale 登录状态，不自动切换出口、不重启共享服务。新功能涉及代理服务时，需在维护窗口手动切换/重建后验收，不能把“更新文件”当作运行中进程已经更新。
+
+v0.1.1 升至 v0.1.2 只改公网探测策略，安装即生效，无需 `egress reload`、重新进壳或重启服务。SOCKS/HTTP 公网探测每次握手期限 15 秒、总期限 20 秒；仅 curl `28`（超时）在同一出口重试一次。连接拒绝、SOCKS 失败、证书错误、HTTP 错误、无效响应不会因此重试或被当作成功。三个公网探测最坏合计约 120 秒，另有宿主机与隔离检查耗时。重试不代表自动重试应用请求，也不切换/回落其他出口；完整验收条件不变。
 
 从 v0.1.0 升至 v0.1.1，安装后在普通 SSH 管理窗口执行 `egress reload`，只重启共享应用代理并验收，保留 Tailscale、当前节点、工作壳与防火墙；已有代理连接会中断。此命令要求现有服务与硬隔离已经就绪，不负责重新配置网络。已开的工作壳环境不会随文件更新：在旧工作壳 `exit`，然后 `egress shell` 再执行 `claude`。也可以在旧工作壳只刷新代理环境而不退出：
 
