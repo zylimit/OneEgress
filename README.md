@@ -12,24 +12,26 @@ Ubuntu 24.04、systemd、管理默认网卡 `eth0`、`/dev/net/tun`，管理员�
 
 依赖：Tailscale、curl、jq、iproute2、iptables（含 IPv6）、Python 3、util-linux。Tailscale 请按[官方安装说明](https://tailscale.com/docs/install)安装；本项目不运行远程安装脚本、不自动安装依赖。
 
-系统 `tailscaled` 必须 **inactive / masked**。不要在依赖 Tailscale 的 SSH 连接里停止它；若已有整机 VPN/出口，先通过独立管理连接处理。安装器只检查，不擅自修改系统服务或管理路由。
+v0.1.3 起，系统 `tailscaled` 可以运行并承担 Peer Relay，WireGuard 可保留独立私网。宿主机不得选择 Tailscale 出口或启用路由导入；IPv4 管理默认路由必须唯一且走 `eth0`，其他策略表和 IPv6 也不得将公共流量导向其他接口。检查同时验证普通管理流量和隔离路由器传输的实际路由。安装器只检查，不停止系统服务、不擅自修改管理路由或其他组件防火墙。旧版本仍要求系统 Tailscale 停用，不可直接按新版本规则放行旧代码。
 
 ## 下载与安装
 
 从 [Releases](https://github.com/zylimit/OneEgress/releases) 下载指定版本和校验文件。推荐固定版本，不执行 `curl | sudo bash`。
 
 ```bash
-curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.2/oneegress-v0.1.2.tar.gz
-curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.2/SHA256SUMS
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.3/oneegress-v0.1.3.tar.gz
+curl -fLO https://github.com/zylimit/OneEgress/releases/download/v0.1.3/SHA256SUMS
 sha256sum -c SHA256SUMS
-tar -xzf oneegress-v0.1.2.tar.gz
-cd oneegress-0.1.2
+tar -xzf oneegress-v0.1.3.tar.gz
+cd oneegress-0.1.3
 sudo ./install.sh --check
 sudo ./install.sh
 egress --version
 ```
 
 现有机器升级使用相同命令。安装/升级保留 `/var/lib/tailscale-egress/config.json` 和 Tailscale 登录状态，不自动切换出口、不重启共享服务。新功能涉及代理服务时，需在维护窗口手动切换/重建后验收，不能把“更新文件”当作运行中进程已经更新。
+
+升级至 v0.1.3 后，在管理窗口执行 `egress repair` 迁移私有 DNS：会中断所有工作壳的当前代理连接、重启隔离 Tailscale 和应用代理，但不停止宿主机中继、不改 WireGuard/Docker、不改路由和防火墙、不切换出口、不关闭工作壳。仅支持已有隔离服务和可确认的唯一出口；失败时保持代理不可用，不尝试其他设备。两个服务的私有 `/etc` 使用只读 DNS/NSS 文件和必要运行文件，不跟随宿主机 `resolv.conf` 的改写或软链接替换。普通 `reload` 不能迁移旧挂载；检查不合格时会明确要求 `repair`。
 
 v0.1.1 升至 v0.1.2 只改公网探测策略，安装即生效，无需 `egress reload`、重新进壳或重启服务。SOCKS/HTTP 公网探测每次握手期限 15 秒、总期限 20 秒；仅 curl `28`（超时）在同一出口重试一次。连接拒绝、SOCKS 失败、证书错误、HTTP 错误、无效响应不会因此重试或被当作成功。三个公网探测最坏合计约 120 秒，另有宿主机与隔离检查耗时。重试不代表自动重试应用请求，也不切换/回落其他出口；完整验收条件不变。
 
@@ -61,13 +63,15 @@ egress config switch iphone
 egress switch iphone
 ```
 
-出口设备须同一尾网、联网、宣告 exit node 并在 Tailscale 后台获准。不要启动已 masked 的系统 `tailscaled`，不要运行省略 `--socket` 的出口设置命令。
+出口设备须同一尾网、联网、宣告 exit node 并在 Tailscale 后台获准。不要运行省略 `--socket` 的出口设置命令：那会操作宿主机 Tailscale，而不是 OneEgress。Peer Relay 的配置与工作出口选择是两回事。
 
 ## 日常命令
 
 ```bash
 egress check                  # 只读：当前节点、公网 IP、运营商、隔离
 egress reload                 # 升级后仅重载共享代理；已有网络连接会中断
+egress repair                 # 迁移/修复私有 DNS，重建隔离服务，保留当前节点
+egress test                   # 短暂阻断代理隧道，影响所有工作壳联网；自动恢复并验收
 egress switch ipad            # 全局切换；所有工作壳的后续连接使用此出口
 egress shell                  # 默认用户，当前共享出口
 egress shell ubuntu           # 只改变登录用户，不创建私有出口
@@ -79,7 +83,11 @@ exit                          # 离开本工作壳；清理其后台进程，保
 
 管理命令从普通 SSH 窗口执行，不在 `[work:...]` 壳内执行。多个管理窗口同时写配置/切换时，第二次操作返回 `75`，不会排队执行一个过时切换。`check` 返回 `0` 已确认、`1` 不安全、`2` 无法确认。
 
-紧急停止：在管理窗口执行 `sudo egress down`，它会停止共享服务并关闭**全部**工作壳。不要用它代替普通 `exit`。兼容的 `enter` 只进入当前共享出口；旧 `up/start` 会按全局旧偏好选路，新部署只用显式 `switch`。
+紧急停止：在管理窗口执行 `sudo egress down`，它会停止共享服务并关闭**全部**工作壳。不要用它代替普通 `exit`。兼容的 `enter` 只进入当前共享出口；v0.1.3 的旧 `up/start` 等价于 `switch`，不再自动尝试候选，旧 mudi/phone/home 偏好命令已停用。
+
+`egress test` 先验收正常出口，在独立路由器的代理 UID 隔离链临时加入 IPv4/IPv6 隧道 REJECT，以固定 IP 测试 SOCKS、HTTP、绕过代理直连均失败，再删除本工具的临时规则、核对原硬隔离并验收同一节点。不关闭 TUN、不改路由、不阻断 root Tailscale 的控制/中继传输。全局锁防止其他窗口同时切换；正常退出和 INT/TERM/HUP 会尝试清理。SIGKILL、断电无法执行清理：最坏保持断网，可在管理窗口 `egress repair` 清理已知测试阻断并重建服务；不自动切换出口。该测试不是实际手机断网、设备掉电、账号登录或所有目标网站的完整证明。
+
+目前服务/命名空间仍由显式命令创建，使用临时 systemd 单元；不要把本次运行验收当作整机重启后自动恢复保障。暂不自动添加开机切换或出口回退。宿主机控制 socket 对工作用户的进一步收口、长期连接超时和防火墙归属梳理是后续独立验收项。sudo/root/docker/lxd 等有权绕过隔离的管理员不在防误用保证范围内。
 
 ## 每次部署的手动验收
 

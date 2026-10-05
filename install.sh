@@ -43,9 +43,7 @@ if [[ -z $DESTDIR ]]; then
     command -v "$dependency" >/dev/null || fail "缺少依赖 $dependency；见 README 安装前准备。"
   done
   [[ -c /dev/net/tun ]] || fail '缺少 /dev/net/tun'
-  [[ $(systemctl is-enabled tailscaled 2>/dev/null || true) == masked ]] || fail '系统 tailscaled 必须已 masked；安装器不会自动修改管理网络。'
-  [[ $(systemctl is-active tailscaled 2>/dev/null || true) == inactive ]] || fail '系统 tailscaled 必须 inactive。'
-  [[ $(ip -4 route show default | awk '{print $5; exit}') == eth0 ]] || fail 'v0.1.0 仅支持管理默认网卡 eth0；不改当前路由。'
+  bash -c 'source <(awk '\''/^# 只供受限 systemd 服务使用/{exit} {print}'\'' "$1"); host_boundary_ok' -- "$SOURCE" || fail '宿主机共存边界未通过；不停止系统 Tailscale、不改变路由。'
   [[ $(sysctl -n net.ipv4.ip_forward) == 1 ]] || fail '隔离路由器需要宿主机 net.ipv4.ip_forward=1；请先由管理员确认转发策略，安装器不自动开启。'
   [[ $DEFAULT_USER =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*\$?$ ]] || fail '用户名无效'
   getent passwd "$DEFAULT_USER" >/dev/null || fail "工作壳用户不存在: $DEFAULT_USER；用 --user 指定已有用户。"
